@@ -1,0 +1,216 @@
+From 8662e7edebf5755cb1275f608c20d4283a5fee10 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <5267690+ShuhaoZhangTony@users.noreply.github.com>
+Date: Tue, 4 Aug 2026 15:05:32 +0800
+Subject: [PATCH] feat: capture normalized KV copy descriptors
+
+Write one fail-closed, region-relative descriptor inventory per transfer job when the B134 layout probe is enabled. Raw process addresses are never persisted.
+
+Assisted-by: OpenAI Codex
+---
+ tests/v1/test_b134_descriptor_layout.py       | 54 ++++++++++++++
+ .../kv_offload/cpu/b134_descriptor_layout.py  | 71 +++++++++++++++++++
+ vllm/v1/kv_offload/cpu/npu_worker.py          | 28 ++++++++
+ 3 files changed, 153 insertions(+)
+ create mode 100644 tests/v1/test_b134_descriptor_layout.py
+ create mode 100644 vllm/v1/kv_offload/cpu/b134_descriptor_layout.py
+
+diff --git a/tests/v1/test_b134_descriptor_layout.py b/tests/v1/test_b134_descriptor_layout.py
+new file mode 100644
+index 00000000000..cbf7586c267
+--- /dev/null
++++ b/tests/v1/test_b134_descriptor_layout.py
+@@ -0,0 +1,54 @@
++import importlib.util
++import json
++import stat
++from pathlib import Path
++
++MODULE_PATH = (
++    Path(__file__).parents[2]
++    / "vllm"
++    / "v1"
++    / "kv_offload"
++    / "cpu"
++    / "b134_descriptor_layout.py"
++)
++
++
++def _load_module():
++    spec = importlib.util.spec_from_file_location("b134_layout_test", MODULE_PATH)
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_capture_is_disabled_without_output_directory(monkeypatch) -> None:
++    monkeypatch.delenv("B134_DESCRIPTOR_LAYOUT_DIR", raising=False)
++    module = _load_module()
++    assert module.CAPTURE_ENABLED is False
++    assert module.capture_descriptor_layout(1, "d2h", []) is None
++
++
++def test_capture_writes_only_region_relative_offsets(monkeypatch, tmp_path) -> None:
++    monkeypatch.setenv("B134_DESCRIPTOR_LAYOUT_DIR", str(tmp_path))
++    module = _load_module()
++    output = module.capture_descriptor_layout(
++        7,
++        "d2h",
++        [
++            {
++                "direction": "d2h",
++                "dst_offset": 0,
++                "dst_region": "dst_tensor_0",
++                "size": 4096,
++                "src_offset": 8192,
++                "src_region": "src_tensor_0",
++            }
++        ],
++    )
++    assert output is not None
++    payload = json.loads(output.read_text(encoding="utf-8"))
++    assert payload["schema"] == "kv-transfer-descriptor-layout/v1"
++    assert payload["evidence_label"] == "existing-server-probe"
++    assert payload["descriptors"][0]["src_offset"] == 8192
++    assert "address" not in output.read_text(encoding="utf-8")
++    assert stat.S_IMODE(output.stat().st_mode) == 0o600
+diff --git a/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py b/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py
+new file mode 100644
+index 00000000000..ad35cf986d9
+--- /dev/null
++++ b/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py
+@@ -0,0 +1,71 @@
++"""Optional normalized descriptor capture for B134 layout probes."""
++
++import json
++import os
++from pathlib import Path
++from typing import Any
++
++_CAPTURE_DIR = os.environ.get("B134_DESCRIPTOR_LAYOUT_DIR")
++_EVIDENCE_LABEL = os.environ.get(
++    "B134_DESCRIPTOR_EVIDENCE_LABEL",
++    "existing-server-probe",
++)
++CAPTURE_ENABLED = bool(_CAPTURE_DIR)
++_ALLOWED_EVIDENCE_LABELS = {
++    "existing-server-probe",
++    "real-online",
++    "replay",
++    "simulation/model",
++}
++
++
++def capture_descriptor_layout(
++    job_id: int,
++    direction: str,
++    descriptors: list[dict[str, Any]],
++) -> Path | None:
++    """Write one region-relative inventory without process addresses."""
++    if not CAPTURE_ENABLED:
++        return None
++    if _EVIDENCE_LABEL not in _ALLOWED_EVIDENCE_LABELS:
++        raise ValueError(f"unsupported descriptor evidence label: {_EVIDENCE_LABEL}")
++    if direction not in {"d2h", "h2d"}:
++        raise ValueError(f"unsupported descriptor direction: {direction}")
++    if not descriptors:
++        raise ValueError("descriptor inventory is empty")
++
++    for descriptor in descriptors:
++        if descriptor["src_offset"] < 0 or descriptor["dst_offset"] < 0:
++            raise ValueError("descriptor offsets must be non-negative")
++        if descriptor["size"] <= 0:
++            raise ValueError("descriptor size must be positive")
++        if descriptor["direction"] != direction:
++            raise ValueError("descriptor direction changed within one inventory")
++
++    assert _CAPTURE_DIR is not None
++    capture_dir = Path(_CAPTURE_DIR)
++    if not capture_dir.is_dir():
++        raise ValueError(f"descriptor capture directory does not exist: {capture_dir}")
++    output = capture_dir / f"{os.getpid()}-{direction}-job{job_id}.json"
++    payload = {
++        "descriptors": descriptors,
++        "direction": direction,
++        "evidence_label": _EVIDENCE_LABEL,
++        "job_id": job_id,
++        "schema": "kv-transfer-descriptor-layout/v1",
++    }
++    data = (
++        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
++    ).encode("utf-8")
++    descriptor = os.open(
++        output,
++        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
++        0o600,
++    )
++    try:
++        written = os.write(descriptor, data)
++        if written != len(data):
++            raise OSError("short descriptor inventory write")
++    finally:
++        os.close(descriptor)
++    return output
+diff --git a/vllm/v1/kv_offload/cpu/npu_worker.py b/vllm/v1/kv_offload/cpu/npu_worker.py
+index ffb1cb31de2..62c4d66f746 100644
+--- a/vllm/v1/kv_offload/cpu/npu_worker.py
++++ b/vllm/v1/kv_offload/cpu/npu_worker.py
+@@ -21,6 +21,10 @@ from vllm.v1.kv_offload.base import (
+     OffloadingWorker,
+     TransferResult,
+ )
++from vllm.v1.kv_offload.cpu.b134_descriptor_layout import (
++    CAPTURE_ENABLED,
++    capture_descriptor_layout,
++)
+ from vllm.v1.kv_offload.cpu.gpu_worker import compute_sub_block_ptrs
+ from vllm.v1.kv_offload.cpu.shared_offload_region import SharedOffloadRegion
+ 
+@@ -249,6 +253,9 @@ class AscendSingleDirectionOffloadingHandler:
+         dst_offset = 0
+         op_idx = 0
+         num_transfer_bytes = 0
++        layout_descriptors: list[dict[str, int | str]] | None = (
++            [] if CAPTURE_ENABLED else None
++        )
+         for group_size, block_idx, group_data_refs in zip(
+             group_sizes, block_indices, self.kv_cache_groups_data_refs
+         ):
+@@ -287,6 +294,21 @@ class AscendSingleDirectionOffloadingHandler:
+                     skip_count=dst_skip,
+                 )
+                 all_sizes[op_idx:end_idx] = data_ref.page_size_bytes
++                if layout_descriptors is not None:
++                    src_base = self.src_tensors[data_ref.tensor_idx].data_ptr()
++                    dst_base = self.dst_tensors[data_ref.tensor_idx].data_ptr()
++                    direction = "d2h" if self.npu_to_cpu else "h2d"
++                    for descriptor_idx in range(op_idx, end_idx):
++                        layout_descriptors.append(
++                            {
++                                "direction": direction,
++                                "dst_offset": int(all_dst[descriptor_idx]) - dst_base,
++                                "dst_region": f"dst_tensor_{data_ref.tensor_idx}",
++                                "size": int(all_sizes[descriptor_idx]),
++                                "src_offset": int(all_src[descriptor_idx]) - src_base,
++                                "src_region": f"src_tensor_{data_ref.tensor_idx}",
++                            }
++                        )
+                 num_transfer_bytes += group_size * data_ref.page_size_bytes
+                 op_idx = end_idx
+ 
+@@ -296,6 +318,12 @@ class AscendSingleDirectionOffloadingHandler:
+         assert src_offset == len(src_blocks)
+         assert dst_offset == len(dst_blocks)
+         assert op_idx == num_copy_ops
++        if layout_descriptors is not None:
++            capture_descriptor_layout(
++                job_id,
++                "d2h" if self.npu_to_cpu else "h2d",
++                layout_descriptors,
++            )
+         descriptors_done_at = time.monotonic() if EVENTS_ENABLED else 0.0
+ 
+         npu = _get_torch_npu()
+-- 
+2.53.0.windows.3
+

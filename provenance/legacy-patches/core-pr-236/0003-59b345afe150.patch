@@ -1,0 +1,127 @@
+From 59b345afe1507835f0662f0202d93df5924edade Mon Sep 17 00:00:00 2001
+From: Remby Lis <153624059+Remygred@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 14:44:53 +0000
+Subject: [PATCH] fix(kv): invalidate flushed recovery contexts
+
+Assisted-by: OpenAI Codex
+---
+ tests/v1/test_kv_recovery_profile.py          | 22 ++++++++++
+ .../kv_connector/v1/offloading/worker.py      |  6 +++
+ vllm/v1/kv_recovery_profile.py                | 44 +++++++++++++++++++
+ 3 files changed, 72 insertions(+)
+
+diff --git a/tests/v1/test_kv_recovery_profile.py b/tests/v1/test_kv_recovery_profile.py
+index d58cca7c48..51c3fb2487 100644
+--- a/tests/v1/test_kv_recovery_profile.py
++++ b/tests/v1/test_kv_recovery_profile.py
+@@ -765,6 +765,28 @@ def test_foreign_run_transfer_cannot_enter_wait_membership():
+     assert sink.failures == ["foreign_run_transfer", "invalid_wait_membership"]
+ 
+ 
++@pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
++def test_connector_flush_invalidates_pending_context_exactly_once(operation):
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context(operation=operation))
++    assert attempt is not None
++    observer.transfer_submitted(attempt, 10)
++
++    observer.invalidate_transfers(frozenset({7, 8}))
++    observer.invalidate_transfers(frozenset({7}))
++
++    assert observer.prepared_transfer_count == 0
++    assert observer.pending_h2d_count == 0
++    assert observer.pending_d2h_count == 0
++    assert observer.evidence_disabled
++    assert sink.failures == ["connector_flush_invalidation"]
++    assert observer.transfer_completed(7, 20, True, 128, 5) is None
++    assert sink.failures == ["connector_flush_invalidation"]
++
++
+ @pytest.mark.parametrize(
+     ("connector_job_id", "timestamp_ns", "success", "bytes_moved", "duration_ns"),
+     [
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index a9e9a5e815..5e8ed0db02 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -510,6 +510,12 @@ class OffloadingConnectorWorker:
+         self._submit_pending_stores()
+ 
+         if kv_connector_metadata.jobs_to_flush:
++            observer = self._kv_recovery_observer
++            if observer is not None:
++                with suppress(Exception):
++                    observer.invalidate_transfers(
++                        frozenset(kv_connector_metadata.jobs_to_flush)
++                    )
+             wait_membership = self._prepare_kv_recovery_wait(
+                 kv_connector_metadata.jobs_to_flush
+             )
+diff --git a/vllm/v1/kv_recovery_profile.py b/vllm/v1/kv_recovery_profile.py
+index aa25762d09..442bee6b5a 100644
+--- a/vllm/v1/kv_recovery_profile.py
++++ b/vllm/v1/kv_recovery_profile.py
+@@ -506,6 +506,11 @@ class KVRecoveryWorkerObserver(Protocol):
+         connector_job_ids: frozenset[int],
+     ) -> KVRecoveryWaitMembership | None: ...
+ 
++    def invalidate_transfers(
++        self,
++        connector_job_ids: frozenset[int],
++    ) -> None: ...
++
+     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
+ 
+     def h2d_receipt_capacity_exhausted(
+@@ -987,6 +992,45 @@ class BoundedKVRecoveryWorkerObserver:
+                 )
+             )
+ 
++    def invalidate_transfers(self, connector_job_ids: frozenset[int]) -> None:
++        """Consume formal contexts named by an EngineCore flush handoff."""
++        if not connector_job_ids:
++            return
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed:
++                    return
++                invalidated: list[KVRecoveryTransferAttempt] = []
++                for connector_job_id in sorted(connector_job_ids):
++                    prepared = self._prepared_by_job_id.pop(connector_job_id, None)
++                    if prepared is not None:
++                        invalidated.append(prepared)
++                    transfer_id = self._h2d_transfer_id_by_connector_job_id.pop(
++                        connector_job_id, None
++                    )
++                    if transfer_id is not None:
++                        pending_h2d = self._pending_h2d_by_transfer_id.pop(
++                            transfer_id, None
++                        )
++                        if pending_h2d is not None:
++                            invalidated.append(pending_h2d.attempt)
++                    pending_d2h = self._pending_d2h_by_job_id.pop(
++                        connector_job_id, None
++                    )
++                    if pending_d2h is not None:
++                        invalidated.append(pending_d2h.attempt)
++                if invalidated:
++                    self._evidence_disabled = True
++            if invalidated:
++                self._sink.evidence_failure(
++                    reason="connector_flush_invalidation",
++                    connector_job_ids=tuple(
++                        attempt.connector_job_id for attempt in invalidated
++                    ),
++                    transfer_ids=tuple(attempt.transfer_id for attempt in invalidated),
++                    timestamp_ns=None,
++                )
++
+     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None:
+         with self._lifecycle_lock:
+             with self._state_lock:
+-- 
+2.53.0.windows.3
+

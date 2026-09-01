@@ -1,0 +1,205 @@
+From 4e2c2044981df8e7f390da46a9d5291056d7d4d8 Mon Sep 17 00:00:00 2001
+From: Xie Hanlong <xiehanlong834@gmail.com>
+Date: Tue, 4 Aug 2026 16:21:39 +0800
+Subject: [PATCH] fix: make cpu_store emit reachable and align restore event
+ order
+
+Address advisor review on #220 (3 blocking points):
+
+- CPUOffloadingManager.prepare_store: move the cpu_store emit before
+  the return so the host-residency event is actually written.
+- Scheduler: emit wakeup before admission/scheduled for restored
+  requests, matching the contracted wakeup -> admission -> scheduled
+  chain order.
+- Tests: add append-order JSONL test (test_b134_events.py) and an
+  AST-based chain contract test suite (test_b134_chain_contract.py)
+  covering event order, log_stats decoupling, emit reachability and
+  restore_start/restore_done ordering without requiring torch/tblib.
+
+Co-authored-by: Hermes Agent
+---
+ tests/v1/test_b134_chain_contract.py | 94 ++++++++++++++++++++++++++++
+ tests/v1/test_b134_events.py         | 17 +++++
+ vllm/v1/core/sched/scheduler.py      |  3 +-
+ vllm/v1/kv_offload/cpu/manager.py    | 11 ++--
+ 4 files changed, 119 insertions(+), 6 deletions(-)
+ create mode 100644 tests/v1/test_b134_chain_contract.py
+
+diff --git a/tests/v1/test_b134_chain_contract.py b/tests/v1/test_b134_chain_contract.py
+new file mode 100644
+index 00000000000..a11113d0e28
+--- /dev/null
++++ b/tests/v1/test_b134_chain_contract.py
+@@ -0,0 +1,94 @@
++"""Source-level contract tests for the B134 six-event chain ordering.
++
++These tests do not import vLLM runtime modules (no torch/tblib needed): they
++parse the source with ``ast`` and assert the ordering contract structurally,
++so a future edit that regresses the event order, moves an emit past an early
++return, or re-gates an emit on ``log_stats`` is caught in a plain pytest
++environment.
++"""
++
++import ast
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).parents[2]
++SCHEDULER = REPO_ROOT / "vllm" / "v1" / "core" / "sched" / "scheduler.py"
++CPU_MANAGER = REPO_ROOT / "vllm" / "v1" / "kv_offload" / "cpu" / "manager.py"
++TIERING_MANAGER = REPO_ROOT / "vllm" / "v1" / "kv_offload" / "tiering" / "manager.py"
++
++
++def _emit_calls(tree: ast.AST) -> list[tuple[str, int]]:
++    """Return (event_name, lineno) for every ``emit("event", ...)`` call."""
++    calls: list[tuple[str, int]] = []
++    for node in ast.walk(tree):
++        if (
++            isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Name)
++            and node.func.id == "emit"
++            and node.args
++            and isinstance(node.args[0], ast.Constant)
++            and isinstance(node.args[0].value, str)
++        ):
++            calls.append((node.args[0].value, node.lineno))
++    return calls
++
++
++def _is_gated_on_log_stats(tree: ast.AST, emit_lineno: int) -> bool:
++    """True if the emit at emit_lineno sits inside an ``if self.log_stats``."""
++    for node in ast.walk(tree):
++        if (
++            isinstance(node, ast.If)
++            and isinstance(node.test, ast.Attribute)
++            and node.test.attr == "log_stats"
++            and node.lineno < emit_lineno <= node.end_lineno
++        ):
++            return True
++    return False
++
++
++def test_restore_chain_order_in_scheduler_source() -> None:
++    """Restore requests must emit wakeup -> admission -> scheduled."""
++    tree = ast.parse(SCHEDULER.read_text(encoding="utf-8"))
++    events = dict(_emit_calls(tree))
++    assert events["wakeup"] < events["admission"] < events["scheduled"]
++
++
++def test_b134_emits_are_not_gated_on_log_stats() -> None:
++    """preempt/scheduled/admission/wakeup must not depend on log_stats."""
++    tree = ast.parse(SCHEDULER.read_text(encoding="utf-8"))
++    events = dict(_emit_calls(tree))
++    for event in ("preempt", "wakeup", "admission", "scheduled"):
++        assert not _is_gated_on_log_stats(tree, events[event]), (
++            f"{event} emit at line {events[event]} is gated on log_stats"
++        )
++
++
++def test_cpu_store_emit_precedes_return_in_prepare_store() -> None:
++    """cpu_store emit must be reachable, i.e. before any return."""
++    tree = ast.parse(CPU_MANAGER.read_text(encoding="utf-8"))
++    events = dict(_emit_calls(tree))
++    cpu_store_line = events["cpu_store"]
++
++    prepare_store = None
++    for node in ast.walk(tree):
++        if (
++            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
++            and node.name == "prepare_store"
++        ):
++            prepare_store = node
++            break
++    assert prepare_store is not None, "prepare_store not found"
++
++    first_return = min(
++        stmt.lineno for stmt in prepare_store.body if isinstance(stmt, ast.Return)
++    )
++    assert cpu_store_line < first_return, (
++        "cpu_store emit is unreachable: it appears after the return at "
++        f"line {first_return}"
++    )
++
++
++def test_restore_start_precedes_restore_done_in_tiering_manager() -> None:
++    """restore_start must be emitted before restore_done."""
++    tree = ast.parse(TIERING_MANAGER.read_text(encoding="utf-8"))
++    events = dict(_emit_calls(tree))
++    assert events["restore_start"] < events["restore_done"]
+diff --git a/tests/v1/test_b134_events.py b/tests/v1/test_b134_events.py
+index 4cd40026a4b..be51b6a803c 100644
+--- a/tests/v1/test_b134_events.py
++++ b/tests/v1/test_b134_events.py
+@@ -32,3 +32,20 @@ def test_emit_writes_structured_jsonl(monkeypatch, tmp_path) -> None:
+     assert record["fields"] == {"bytes": 4096, "descriptors": 4}
+     assert isinstance(record["pid"], int)
+     assert isinstance(record["ts_monotonic_ns"], int)
++
++
++def test_emit_chain_order_is_append_order(monkeypatch, tmp_path) -> None:
++    """JSONL must preserve the exact per-request event order across emits."""
++    output = tmp_path / "chain.jsonl"
++    monkeypatch.setenv("B134_EVENTS_FILE", str(output))
++    module = _load_module()
++
++    # Contract for restore requests: wakeup -> admission -> scheduled
++    for event in ("wakeup", "admission", "scheduled"):
++        module.emit(event, "request-1")
++
++    events = [
++        json.loads(line)["event"]
++        for line in output.read_text(encoding="utf-8").splitlines()
++    ]
++    assert events == ["wakeup", "admission", "scheduled"]
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 700797f19c0..8f2873b85e5 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1030,6 +1030,8 @@ class Scheduler(SchedulerInterface):
+                     continue
+ 
+                 self.running.append(request)
++                if request.status == RequestStatus.PREEMPTED:
++                    emit("wakeup", request.request_id)
+                 emit("admission", request.request_id)
+                 if self.log_stats:
+                     request.record_event(
+@@ -1040,7 +1042,6 @@ class Scheduler(SchedulerInterface):
+                     scheduled_new_reqs.append(request)
+                 elif request.status == RequestStatus.PREEMPTED:
+                     scheduled_resumed_reqs.append(request)
+-                    emit("wakeup", request.request_id)
+                 else:
+                     raise RuntimeError(f"Invalid request status: {request.status}")
+ 
+diff --git a/vllm/v1/kv_offload/cpu/manager.py b/vllm/v1/kv_offload/cpu/manager.py
+index b47303674bd..2a4e2bbb229 100644
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -241,11 +241,6 @@ class CPUOffloadingManager(OffloadingManager):
+         # build store specs for allocated blocks
+         store_spec = self._get_load_store_spec(keys_to_store, blocks)
+ 
+-        return PrepareStoreOutput(
+-            keys_to_store=keys_to_store,
+-            store_spec=store_spec,
+-            evicted_keys=to_evict,
+-        )
+         if EVENTS_ENABLED:
+             emit(
+                 "cpu_store",
+@@ -255,6 +250,12 @@ class CPUOffloadingManager(OffloadingManager):
+                 stored_keys=len(keys_to_store),
+             )
+ 
++        return PrepareStoreOutput(
++            keys_to_store=keys_to_store,
++            store_spec=store_spec,
++            evicted_keys=to_evict,
++        )
++
+     @override
+     def complete_store(
+         self,
+-- 
+2.53.0.windows.3
+

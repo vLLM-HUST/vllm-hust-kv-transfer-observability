@@ -1,0 +1,1001 @@
+From 837c3585e0c020895af9d450979daabbb4e5f72d Mon Sep 17 00:00:00 2001
+From: Remby Lis <153624059+Remygred@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 14:39:17 +0000
+Subject: [PATCH] feat(kv): complete default-off recovery observer wiring
+
+Assisted-by: OpenAI Codex
+---
+ .../test_kv_recovery_scheduler.py             |  56 +++++-
+ .../test_kv_recovery_worker.py                | 131 +++++++++++--
+ .../test_worker_metadata.py                   |   6 +-
+ tests/v1/test_kv_recovery_profile.py          | 100 +++++++++-
+ .../kv_connector/v1/offloading/common.py      |  16 +-
+ .../kv_connector/v1/offloading/scheduler.py   |  63 ++++++-
+ .../kv_connector/v1/offloading/worker.py      |   5 +-
+ vllm/v1/kv_recovery_profile.py                | 172 ++++++++++++++----
+ 8 files changed, 480 insertions(+), 69 deletions(-)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+index 695951327e..e7828393e7 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+@@ -40,10 +40,21 @@ class RecordingSchedulerObserver:
+         self.logical_ids: dict[tuple[str, int, int], str] = {}
+         self.contexts: list[KVRecoveryTransferContext] = []
+         self.receipt_batches: list[tuple[tuple[KVRecoveryH2DReceipt, ...], bool]] = []
++        self.preemptions: list[tuple[str, int]] = []
++        self.admission_starts: list[tuple[str, int]] = []
++        self.admissions: list[tuple[str, int]] = []
++        self.terminals: list[str] = []
++        self.runtime_events: list[tuple[str, str, int | None]] = []
++        self.receipt_ready_request_ids: set[str] = set()
+         self.reset_thresholds: list[int] = []
+         self.closed = False
+ 
++    def request_preempted(self, runtime_request_id, recovery_epoch):
++        self.preemptions.append((runtime_request_id, recovery_epoch))
++        self.runtime_events.append(("preempted", runtime_request_id, recovery_epoch))
++
+     def prepare_transfer_context(self, runtime_request_id, operation, coordinates):
++        self.runtime_events.append((operation, runtime_request_id, None))
+         trace_id = hashlib.sha256(runtime_request_id.encode()).hexdigest()[:32]
+         lifecycle_id = f"{trace_id}:e:0"
+         is_recovery = operation == "h2d_restore"
+@@ -89,8 +100,31 @@ class RecordingSchedulerObserver:
+         self.contexts.append(context)
+         return context
+ 
+-    def consume_h2d_receipts(self, receipts, receipts_truncated):
+-        self.receipt_batches.append((receipts, receipts_truncated))
++    def consume_h2d_receipts(self, receipts, receipt_capacity_exhausted):
++        self.receipt_batches.append((receipts, receipt_capacity_exhausted))
++        self.runtime_events.extend(
++            ("receipt", receipt.identity.runtime_request_id, None)
++            for receipt in receipts
++        )
++        self.receipt_ready_request_ids.update(
++            receipt.identity.runtime_request_id for receipt in receipts
++        )
++
++    def request_admission_started(self, runtime_request_id, recovery_epoch):
++        if runtime_request_id not in self.receipt_ready_request_ids:
++            return
++        self.admission_starts.append((runtime_request_id, recovery_epoch))
++        self.runtime_events.append(
++            ("admission_started", runtime_request_id, recovery_epoch)
++        )
++
++    def request_admitted(self, runtime_request_id, recovery_epoch):
++        self.admissions.append((runtime_request_id, recovery_epoch))
++        self.runtime_events.append(("admitted", runtime_request_id, recovery_epoch))
++
++    def request_terminal(self, runtime_request_id):
++        self.terminals.append(runtime_request_id)
++        self.runtime_events.append(("terminal", runtime_request_id, None))
+ 
+     def reset(self, stale_job_threshold):
+         self.reset_thresholds.append(stale_job_threshold)
+@@ -165,8 +199,8 @@ class RecordingWorkerObserver:
+     def wait_completed(self, attempt):
+         self.waits.append(attempt)
+ 
+-    def h2d_receipt_truncated(self, receipt):
+-        raise AssertionError("receipt transport unexpectedly truncated")
++    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
++        raise AssertionError("receipt capacity unexpectedly exhausted")
+ 
+     def close(self):
+         return None
+@@ -317,6 +351,19 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
+     assert len(receipts) == 1
+     assert receipts[0].identity == h2d_contexts[0].identity
+     assert receipts[0].block_set_id == h2d_contexts[0].block_set_id
++    runtime_request_id = h2d_contexts[0].identity.runtime_request_id
++    assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
++    assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
++    assert factory.scheduler.admissions == [(runtime_request_id, 1)]
++    event_names = [
++        event_name
++        for event_name, request_id, _ in factory.scheduler.runtime_events
++        if request_id == runtime_request_id
++    ]
++    assert event_names.index("preempted") < event_names.index("h2d_restore")
++    assert event_names.index("h2d_restore") < event_names.index("receipt")
++    assert event_names.index("receipt") < event_names.index("admission_started")
++    assert event_names.index("admission_started") < event_names.index("admitted")
+ 
+ 
+ def test_scheduler_observer_failure_is_fail_open(
+@@ -343,6 +390,7 @@ def test_scheduler_observer_failure_is_fail_open(
+     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+ 
+     assert factory.worker.contexts == []
++    assert factory.scheduler.terminals == ["0"]
+ 
+ 
+ def test_malformed_scheduler_observer_return_is_fail_open(
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+index aa3c13f94f..07ea0c33ab 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+@@ -6,7 +6,9 @@ from collections.abc import Iterable
+ 
+ import pytest
+ 
++import vllm.distributed.kv_transfer.kv_connector.v1.offloading.common as common_module
+ import vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker as worker_module
++import vllm.v1.kv_recovery_profile as recovery_profile
+ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+     OffloadingConnectorMetadata,
+     TransferJob,
+@@ -84,7 +86,7 @@ class RecordingObserver:
+         self.attempts: dict[int, KVRecoveryTransferAttempt] = {}
+         self.transfer_seq = 0
+         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
+-        self.receipt_truncations: list[KVRecoveryH2DReceipt] = []
++        self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
+         self.closed = False
+ 
+     def _raise_if_requested(self, stage: str):
+@@ -168,8 +170,8 @@ class RecordingObserver:
+         self.events.append(("observer_wait_completed", attempt.transfer_ids))
+         self.wait_completed_calls.append(attempt)
+ 
+-    def h2d_receipt_truncated(self, receipt):
+-        self.receipt_truncations.append(receipt)
++    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
++        self.receipt_capacity_losses.append((receipt, loss_reason))
+ 
+     def close(self):
+         self._raise_if_requested("close")
+@@ -181,10 +183,12 @@ class RecordingEvidenceSink:
+         self.submissions: list[tuple[KVRecoveryTransferAttempt, int]] = []
+         self.not_submitted: list[KVRecoveryTransferAttempt] = []
+         self.completions: list[int] = []
+-        self.capacity_losses: list[tuple[KVRecoveryTransferAttempt, int, str]] = []
++        self.capacity_losses: list[
++            tuple[KVRecoveryTransferAttempt, str, int | None, str]
++        ] = []
+         self.failures: list[tuple[str, tuple[int, ...]]] = []
+         self.waits: list[KVRecoveryWaitAttempt] = []
+-        self.truncated: list[KVRecoveryH2DReceipt] = []
++        self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
+         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
+ 
+     def transfer_submitted(self, attempt, timestamp_ns):
+@@ -226,8 +230,14 @@ class RecordingEvidenceSink:
+             bytes_moved=bytes_moved,
+         )
+ 
+-    def pending_h2d_capacity_exhausted(self, attempt, timestamp_ns, loss_reason):
+-        self.capacity_losses.append((attempt, timestamp_ns, loss_reason))
++    def transfer_capacity_exhausted(
++        self,
++        attempt,
++        capacity,
++        timestamp_ns,
++        loss_reason,
++    ):
++        self.capacity_losses.append((attempt, capacity, timestamp_ns, loss_reason))
+ 
+     def evidence_failure(
+         self,
+@@ -241,8 +251,8 @@ class RecordingEvidenceSink:
+     def wait_completed(self, attempt):
+         self.waits.append(attempt)
+ 
+-    def h2d_receipt_truncated(self, receipt):
+-        self.truncated.append(receipt)
++    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
++        self.receipt_capacity_losses.append((receipt, loss_reason))
+ 
+     def close(self, open_attempts, evidence_disabled):
+         self.close_calls.append((open_attempts, evidence_disabled))
+@@ -366,7 +376,7 @@ def test_disabled_worker_path_preserves_load_semantics():
+     assert worker_meta.completed_jobs == {7: 1}
+     assert worker_meta.transfer_stats.load.bytes == 128
+     assert worker_meta.kv_recovery_h2d_receipts == ()
+-    assert not worker_meta.kv_recovery_h2d_receipts_truncated
++    assert not worker_meta.kv_recovery_h2d_receipt_capacity_exhausted
+ 
+ 
+ def test_disabled_worker_path_does_not_read_profile_clock(
+@@ -732,6 +742,66 @@ def test_successful_wait_is_recorded_only_after_backend_returns():
+     assert observer.wait_completed_calls[0].transfer_ids == (f"{'a' * 32}:t:0",)
+ 
+ 
++def test_prepared_transfer_capacity_is_distinct_and_fail_open(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    monkeypatch.setattr(
++        recovery_profile,
++        "MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS",
++        1,
++    )
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
++    context = make_context("d2h_preserve")
++
++    first = observer.begin_transfer(1, context)
++    second = observer.begin_transfer(2, context)
++
++    assert first is not None
++    assert second is None
++    assert observer.prepared_transfer_count == 1
++    assert observer.transfer_seq == 2
++    assert len(sink.capacity_losses) == 1
++    attempt, capacity, timestamp_ns, loss_reason = sink.capacity_losses[0]
++    assert attempt.connector_job_id == 2
++    assert capacity == "prepared_transfer"
++    assert timestamp_ns is None
++    assert loss_reason == "serialization_failure"
++    assert sink.failures == []
++    assert observer.evidence_disabled
++
++
++def test_pending_d2h_capacity_is_distinct_and_fail_open(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    monkeypatch.setattr(
++        recovery_profile,
++        "MAX_PENDING_D2H_CONTEXTS_PER_PROCESS",
++        1,
++    )
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
++    context = make_context("d2h_preserve")
++    first = observer.begin_transfer(1, context)
++    assert first is not None
++    observer.transfer_submitted(first, 10)
++    second = observer.begin_transfer(2, context)
++    assert second is not None
++
++    observer.transfer_submitted(second, 11)
++
++    assert observer.pending_d2h_count == 1
++    assert len(sink.submissions) == 1
++    assert len(sink.capacity_losses) == 1
++    attempt, capacity, timestamp_ns, loss_reason = sink.capacity_losses[0]
++    assert attempt == second
++    assert capacity == "pending_d2h"
++    assert timestamp_ns == 11
++    assert loss_reason == "serialization_failure"
++    assert sink.failures == []
++    assert observer.evidence_disabled
++
++
+ def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
+     sink = RecordingEvidenceSink()
+     observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
+@@ -750,8 +820,9 @@ def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
+     assert observer.pending_h2d_count == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
+     assert len(sink.submissions) == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
+     assert len(sink.capacity_losses) == 1
+-    dropped_attempt, _, loss_reason = sink.capacity_losses[0]
++    dropped_attempt, capacity, _, loss_reason = sink.capacity_losses[0]
+     assert dropped_attempt.connector_job_id == total_jobs - 1
++    assert capacity == "pending_h2d"
+     assert loss_reason == "serialization_failure"
+     assert sink.failures == []
+     assert observer.evidence_disabled
+@@ -773,3 +844,41 @@ def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
+     open_attempts, evidence_disabled = sink.close_calls[0]
+     assert len(open_attempts) == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
+     assert evidence_disabled
++
++
++def test_late_h2d_receipt_capacity_preserves_prefix_and_fails_evidence_closed(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    monkeypatch.setattr(common_module, "MAX_H2D_RECEIPTS_PER_WORKER_STEP", 1)
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
++    worker, backend, _ = make_worker(observer)
++    context = make_context("h2d_restore")
++    job = make_load_job()
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((1, job), (2, job)),
++            kv_recovery_contexts=((1, context), (2, context)),
++        )
++    )
++    backend.finished.extend(
++        (
++            TransferResult(1, True, 128, 0.25),
++            TransferResult(2, True, 128, 0.25),
++        )
++    )
++
++    worker.get_finished(set())
++    worker_meta = worker.build_connector_worker_meta()
++
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {1: 1, 2: 1}
++    assert len(worker_meta.kv_recovery_h2d_receipts) == 1
++    assert worker_meta.kv_recovery_h2d_receipts[0].connector_job_id == 1
++    assert worker_meta.kv_recovery_h2d_receipt_capacity_exhausted
++    assert sink.completions == [1, 2]
++    assert len(sink.receipt_capacity_losses) == 1
++    late_receipt, loss_reason = sink.receipt_capacity_losses[0]
++    assert late_receipt.connector_job_id == 2
++    assert loss_reason == "serialization_failure"
++    assert observer.evidence_disabled
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py b/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
+index a707fb3100..188cba9e3f 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
+@@ -95,7 +95,7 @@ def test_add_h2d_receipt_does_not_change_completion_counts():
+     assert meta.add_kv_recovery_h2d_receipt(receipt)
+     assert meta.completed_jobs == {42: 1}
+     assert meta.kv_recovery_h2d_receipts == (receipt,)
+-    assert not meta.kv_recovery_h2d_receipts_truncated
++    assert not meta.kv_recovery_h2d_receipt_capacity_exhausted
+ 
+ 
+ def test_aggregate_preserves_duplicate_receipts_for_exact_one_validation():
+@@ -113,7 +113,7 @@ def test_aggregate_preserves_duplicate_receipts_for_exact_one_validation():
+ 
+     assert result.completed_jobs == {42: 2}
+     assert result.kv_recovery_h2d_receipts == (receipt, receipt)
+-    assert not result.kv_recovery_h2d_receipts_truncated
++    assert not result.kv_recovery_h2d_receipt_capacity_exhausted
+     assert meta1.completed_jobs == {42: 1}
+     assert meta2.completed_jobs == {42: 1}
+ 
+@@ -133,4 +133,4 @@ def test_aggregate_bounds_receipts_without_affecting_serving_metadata():
+ 
+     assert result.completed_jobs == {42: 2}
+     assert len(result.kv_recovery_h2d_receipts) == (MAX_H2D_RECEIPTS_PER_WORKER_STEP)
+-    assert result.kv_recovery_h2d_receipts_truncated
++    assert result.kv_recovery_h2d_receipt_capacity_exhausted
+diff --git a/tests/v1/test_kv_recovery_profile.py b/tests/v1/test_kv_recovery_profile.py
+index cd7e927629..d58cca7c48 100644
+--- a/tests/v1/test_kv_recovery_profile.py
++++ b/tests/v1/test_kv_recovery_profile.py
+@@ -16,6 +16,10 @@ import pytest
+ import vllm.v1.kv_recovery_profile as recovery_profile
+ from vllm.v1.kv_recovery_profile import (
+     KV_RECOVERY_PROFILE_BINDING,
++    MAX_H2D_RECEIPTS_PER_WORKER_STEP,
++    MAX_PENDING_D2H_CONTEXTS_PER_PROCESS,
++    MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
++    MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
+     BoundedKVRecoveryWorkerObserver,
+     KVRecoveryBlockCoordinate,
+     KVRecoveryH2DReceipt,
+@@ -138,7 +142,13 @@ class NoopEvidenceSink:
+     def transfer_completed(self, **kwargs):
+         return None
+ 
+-    def pending_h2d_capacity_exhausted(self, attempt, timestamp_ns, loss_reason):
++    def transfer_capacity_exhausted(
++        self,
++        attempt,
++        capacity,
++        timestamp_ns,
++        loss_reason,
++    ):
+         return None
+ 
+     def evidence_failure(
+@@ -153,7 +163,7 @@ class NoopEvidenceSink:
+     def wait_completed(self, attempt):
+         return None
+ 
+-    def h2d_receipt_truncated(self, receipt):
++    def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         return None
+ 
+     def close(self, open_attempts, evidence_disabled):
+@@ -165,16 +175,50 @@ def test_binding_locks_authorized_candidate_digests():
+     assert binding.profile_sha256 == (
+         "b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"
+     )
+-    assert binding.communication_mapping_candidate_sha256 == (
+-        "dca914f989f3a98d43fb9fa2538f7c43a375e8f22f5deb7e09343aee5ee7bc19"
++    assert binding.profile_owner_approval_record_sha256 == (
++        "2831ce52802e7cbe4ec092431c71c18de05491da7ac8d48512014b1d43b3cb0c"
++    )
++    assert binding.observer_policy_sha256 == (
++        "fbee3bc4f74b8c5c20e929c4e37596b06b31c1b9cd02517d8461961a8aedf420"
++    )
++    assert binding.observer_policy_approval_candidate_sha256 == (
++        "27cb52269fff8f10e376f3128384c4aac37f149ad685b89501f98ba50bc0cf29"
++    )
++    assert binding.observer_policy_profile_p0_owner_approval_sha256 == (
++        "322df19ade75797fc4c3f43fe96e689404ef60a270c92081afea03683e734c91"
++    )
++    assert binding.communication_mapping_sha256 == (
++        "095944bbbb1a3ad3518aebfdd61c820ade3affdebd6024b47389cdaec24a3fa3"
++    )
++    assert binding.communication_mapping_approval_candidate_sha256 == (
++        "a686243ffd9c650790e6421e5f976a2a5c010a5d2480e7a30ad8722a9218f3f7"
++    )
++    assert binding.communication_mapping_authority_approval_sha256 == (
++        "42b761177c4bea13833be19ddc143f89c32eee02fbbb98afc2c03249c2783fe5"
++    )
++    assert binding.base_mode_overlay_sha256 == (
++        "d80771b793a9513cdbd4fc2001e21771c56a59d49340ee88d4381027d70b1d5a"
++    )
++    assert binding.base_mode_overlay_approval_candidate_sha256 == (
++        "de889357af659d8e9c1f7daf0aa32656761e80dcf0fea29ef60809912f513694"
++    )
++    assert binding.base_mode_overlay_owner_approval_sha256 == (
++        "50d7deb8f98fcdca36303297a4ce6f7958ae619574d2e1994872936b6fc583a3"
++    )
++    assert binding.g0_remediation_cpu_result_sha256 == (
++        "4b378d10cef6be10fa3fb5a840402da77b1da755781118127a5d30b1cc4b7eb2"
+     )
+-    assert binding.base_mode_overlay_candidate_sha256 == (
+-        "6e035c29664038cdc93b545538cee6fc31abfb79e455d994851f8c9dbfd1c734"
++    assert binding.g1_cpu_source_reauthorization_sha256 == (
++        "448ff68cd139077a2f767fd16359bb5dd8f4cf61cfe258fd48f53a26569718f5"
+     )
+-    assert binding.communication_mapping_status == (
+-        "candidate_issue2_authority_pending"
++    assert binding.communication_mapping_status == "approved_mapping_only"
++    assert binding.base_mode_overlay_status == "approved_overlay_only"
++    assert binding.observer_policy_status == (
++        "profile_P0_items_1_5_approved_runtime_items_6_8_pending"
+     )
+-    assert binding.base_mode_overlay_status == ("candidate_owner_ratification_pending")
++    assert binding.complete_configuration_status == "pending"
++    assert binding.runtime_conformance_status == "pending"
++    assert binding.joint_admission_status == "pending"
+     assert binding.communication_mode == "none"
+     assert not binding.runtime_activation_authorized
+     assert not recovery_profile.KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
+@@ -182,6 +226,44 @@ def test_binding_locks_authorized_candidate_digests():
+     assert binding.device_plugin_audit_commit == (
+         "cafad89a5e103f31ea517c1edb56130578c3cd56"
+     )
++    assert {
++        MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
++        MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
++        MAX_PENDING_D2H_CONTEXTS_PER_PROCESS,
++        MAX_H2D_RECEIPTS_PER_WORKER_STEP,
++    } == {4096}
++
++
++def test_mapping_and_overlay_approval_cannot_open_activation_gate(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    binding = replace(
++        KV_RECOVERY_PROFILE_BINDING,
++        communication_mode=KV_RECOVERY_PROFILE_BINDING.communication_mapping_id,
++        runtime_activation_authorized=True,
++    )
++    monkeypatch.setattr(
++        recovery_profile,
++        "KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED",
++        True,
++    )
++    monkeypatch.setattr(recovery_profile, "KV_RECOVERY_PROFILE_BINDING", binding)
++
++    assert not recovery_profile._activation_gate_open()
++
++    fully_admitted = replace(
++        binding,
++        observer_policy_status="fully_ratified",
++        complete_configuration_status="approved",
++        runtime_conformance_status="conformant",
++        joint_admission_status="approved",
++    )
++    monkeypatch.setattr(
++        recovery_profile,
++        "KV_RECOVERY_PROFILE_BINDING",
++        fully_admitted,
++    )
++    assert recovery_profile._activation_gate_open()
+ 
+ 
+ def test_recovery_abi_round_trips_through_pickle():
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+index ae91bd36a9..7eb0f58132 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+@@ -91,7 +91,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+     completed_jobs: dict[int, int] = field(default_factory=dict)
+     transfer_stats: TransferStats = field(default_factory=TransferStats)
+     kv_recovery_h2d_receipts: tuple[KVRecoveryH2DReceipt, ...] = ()
+-    kv_recovery_h2d_receipts_truncated: bool = False
++    kv_recovery_h2d_receipt_capacity_exhausted: bool = False
+ 
+     def mark_completed(self, job_id: int) -> None:
+         """Record a transfer job completion from this worker."""
+@@ -100,7 +100,7 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+     def add_kv_recovery_h2d_receipt(self, receipt: KVRecoveryH2DReceipt) -> bool:
+         """Append a bounded evidence receipt without affecting completion."""
+         if len(self.kv_recovery_h2d_receipts) >= (MAX_H2D_RECEIPTS_PER_WORKER_STEP):
+-            self.kv_recovery_h2d_receipts_truncated = True
++            self.kv_recovery_h2d_receipt_capacity_exhausted = True
+             return False
+         self.kv_recovery_h2d_receipts = (
+             *self.kv_recovery_h2d_receipts,
+@@ -120,8 +120,8 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+         if (
+             not self.kv_recovery_h2d_receipts
+             and not other.kv_recovery_h2d_receipts
+-            and not self.kv_recovery_h2d_receipts_truncated
+-            and not other.kv_recovery_h2d_receipts_truncated
++            and not self.kv_recovery_h2d_receipt_capacity_exhausted
++            and not other.kv_recovery_h2d_receipt_capacity_exhausted
+         ):
+             return OffloadingWorkerMetadata(
+                 completed_jobs=merged,
+@@ -132,9 +132,9 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+         remaining_capacity = MAX_H2D_RECEIPTS_PER_WORKER_STEP - len(left_receipts)
+         right_receipts = other.kv_recovery_h2d_receipts[:remaining_capacity]
+         combined_receipts = left_receipts + right_receipts
+-        receipts_truncated = (
+-            self.kv_recovery_h2d_receipts_truncated
+-            or other.kv_recovery_h2d_receipts_truncated
++        receipt_capacity_exhausted = (
++            self.kv_recovery_h2d_receipt_capacity_exhausted
++            or other.kv_recovery_h2d_receipt_capacity_exhausted
+             or len(self.kv_recovery_h2d_receipts) > len(left_receipts)
+             or len(other.kv_recovery_h2d_receipts) > len(right_receipts)
+         )
+@@ -143,5 +143,5 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+             completed_jobs=merged,
+             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
+             kv_recovery_h2d_receipts=combined_receipts,
+-            kv_recovery_h2d_receipts_truncated=receipts_truncated,
++            kv_recovery_h2d_receipt_capacity_exhausted=receipt_capacity_exhausted,
+         )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 53c44e5faa..fc7a4b943e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -382,6 +382,7 @@ class OffloadingConnectorScheduler:
+         self._current_batch_kv_recovery_contexts: (
+             dict[int, KVRecoveryTransferContext] | None
+         ) = {} if kv_recovery_observer is not None else None
++        self._kv_recovery_receipt_ready: dict[ReqId, int] = {}
+         self._current_batch_jobs_to_flush: set[int] = set()
+         # GPU block IDs allocated in the current engine step
+         self._current_batch_allocated_block_ids: set[int] = set()
+@@ -1194,7 +1195,53 @@ class OffloadingConnectorScheduler:
+     def build_connector_meta(
+         self, scheduler_output: SchedulerOutput
+     ) -> KVConnectorMetadata:
++        observer = self._kv_recovery_observer
++        if observer is not None:
++            for req_id in sorted(scheduler_output.preempted_req_ids or ()):
++                self._kv_recovery_receipt_ready.pop(req_id, None)
++                req_status = self._req_status.get(req_id)
++                if req_status is not None:
++                    with suppress(Exception):
++                        observer.request_preempted(
++                            req_id,
++                            req_status.req.num_preemptions,
++                        )
++
++        admitted_recovery_epochs: dict[ReqId, int] = {}
++        if observer is not None:
++            resumed_req_ids = set(
++                scheduler_output.scheduled_cached_reqs.resumed_req_ids
++            )
++            resumed_req_ids.update(
++                req.req_id
++                for req in scheduler_output.scheduled_new_reqs
++                if (
++                    (req_status := self._req_status.get(req.req_id)) is not None
++                    and req_status.req.num_preemptions > 0
++                )
++            )
++            for req_id in sorted(resumed_req_ids):
++                req_status = self._req_status.get(req_id)
++                recovery_epoch = self._kv_recovery_receipt_ready.pop(req_id, None)
++                if (
++                    req_status is not None
++                    and recovery_epoch is not None
++                    and recovery_epoch == req_status.req.num_preemptions
++                ):
++                    admitted_recovery_epochs[req_id] = recovery_epoch
++                    with suppress(Exception):
++                        observer.request_admission_started(
++                            req_id,
++                            recovery_epoch,
++                        )
++
+         self._update_req_states(scheduler_output)
++
++        if observer is not None:
++            for req_id, recovery_epoch in admitted_recovery_epochs.items():
++                with suppress(Exception):
++                    observer.request_admitted(req_id, recovery_epoch)
++
+         self.manager.update_device_pressure(
+             scheduler_output.kv_cache_usage,
+             preempted=bool(scheduler_output.preempted_req_ids),
+@@ -1355,11 +1402,12 @@ class OffloadingConnectorScheduler:
+                 del self._req_status[job_status.req_id]
+ 
+         if observer is not None and (
+-            meta.kv_recovery_h2d_receipts or meta.kv_recovery_h2d_receipts_truncated
++            meta.kv_recovery_h2d_receipts
++            or meta.kv_recovery_h2d_receipt_capacity_exhausted
+         ):
+             assert eligible_h2d_receipt_job_ids is not None
+             fresh_receipts: list[KVRecoveryH2DReceipt] = []
+-            receipts_incomplete = meta.kv_recovery_h2d_receipts_truncated
++            receipts_incomplete = meta.kv_recovery_h2d_receipt_capacity_exhausted
+             for receipt in meta.kv_recovery_h2d_receipts:
+                 try:
+                     if not isinstance(receipt, KVRecoveryH2DReceipt):
+@@ -1378,6 +1426,10 @@ class OffloadingConnectorScheduler:
+                         tuple(fresh_receipts),
+                         receipts_incomplete,
+                     )
++                    for receipt in fresh_receipts:
++                        self._kv_recovery_receipt_ready[
++                            receipt.identity.runtime_request_id
++                        ] = receipt.identity.recovery_epoch
+             except Exception:
+                 pass
+ 
+@@ -1413,6 +1465,12 @@ class OffloadingConnectorScheduler:
+             Optional KVTransferParams to be included in the request outputs
+             returned by the engine.
+         """
++        observer = self._kv_recovery_observer
++        if observer is not None:
++            self._kv_recovery_receipt_ready.pop(request.request_id, None)
++            with suppress(Exception):
++                observer.request_terminal(request.request_id)
++
+         # TODO(orozery): possibly kickoff offload for last block
+         # which may have been deferred due to async scheduling
+         req_status = self._req_status.get(request.request_id)
+@@ -1484,6 +1542,7 @@ class OffloadingConnectorScheduler:
+         self._stale_job_threshold = self._job_counter
+         self._jobs.clear()
+         self._block_id_to_pending_jobs.clear()
++        self._kv_recovery_receipt_ready.clear()
+ 
+         observer = self._kv_recovery_observer
+         if observer is not None:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 35c008bcce..a9e9a5e815 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -262,7 +262,10 @@ class OffloadingConnectorWorker:
+         if self._connector_worker_meta.add_kv_recovery_h2d_receipt(receipt):
+             return
+         try:
+-            observer.h2d_receipt_truncated(receipt)
++            observer.h2d_receipt_capacity_exhausted(
++                receipt,
++                "serialization_failure",
++            )
+         except Exception:
+             return
+ 
+diff --git a/vllm/v1/kv_recovery_profile.py b/vllm/v1/kv_recovery_profile.py
+index 0a77bb3206..aa25762d09 100644
+--- a/vllm/v1/kv_recovery_profile.py
++++ b/vllm/v1/kv_recovery_profile.py
+@@ -13,9 +13,12 @@ from threading import Lock
+ from typing import Literal, Protocol
+ 
+ KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
++KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]
+ 
+ MAX_LOGICAL_BLOCKS_PER_SET = 4096
++MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS = 4096
+ MAX_PENDING_H2D_CONTEXTS_PER_PROCESS = 4096
++MAX_PENDING_D2H_CONTEXTS_PER_PROCESS = 4096
+ MAX_H2D_RECEIPTS_PER_WORKER_STEP = 4096
+ MAX_RUNTIME_REQUEST_ID_BYTES = 128
+ MAX_TRANSFER_IDS_PER_WAIT_SET = 4096
+@@ -74,14 +77,29 @@ class KVRecoveryProfileBinding:
+ 
+     profile_id: str
+     profile_sha256: str
++    profile_owner_approval_record_sha256: str
++    observer_policy_id: str
++    observer_policy_sha256: str
++    observer_policy_approval_candidate_sha256: str
++    observer_policy_profile_p0_owner_approval_sha256: str
++    observer_policy_status: str
+     communication_mapping_id: str
+-    communication_mapping_candidate_sha256: str
++    communication_mapping_sha256: str
++    communication_mapping_approval_candidate_sha256: str
++    communication_mapping_authority_approval_sha256: str
++    communication_mapping_status: str
+     base_mode_overlay_id: str
+-    base_mode_overlay_candidate_sha256: str
++    base_mode_overlay_sha256: str
++    base_mode_overlay_approval_candidate_sha256: str
++    base_mode_overlay_owner_approval_sha256: str
++    base_mode_overlay_status: str
++    g0_remediation_cpu_result_sha256: str
++    g1_cpu_source_reauthorization_sha256: str
++    complete_configuration_status: str
++    runtime_conformance_status: str
++    joint_admission_status: str
+     runtime_commit: str
+     device_plugin_audit_commit: str
+-    communication_mapping_status: str
+-    base_mode_overlay_status: str
+     communication_mode: str
+     runtime_activation_authorized: bool
+ 
+@@ -89,18 +107,53 @@ class KVRecoveryProfileBinding:
+ KV_RECOVERY_PROFILE_BINDING = KVRecoveryProfileBinding(
+     profile_id="rlp.kv-recovery/v1alpha1",
+     profile_sha256=("b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"),
++    profile_owner_approval_record_sha256=(
++        "2831ce52802e7cbe4ec092431c71c18de05491da7ac8d48512014b1d43b3cb0c"
++    ),
++    observer_policy_id="rlp.kv-recovery-observer-policy/v1alpha1",
++    observer_policy_sha256=(
++        "fbee3bc4f74b8c5c20e929c4e37596b06b31c1b9cd02517d8461961a8aedf420"
++    ),
++    observer_policy_approval_candidate_sha256=(
++        "27cb52269fff8f10e376f3128384c4aac37f149ad685b89501f98ba50bc0cf29"
++    ),
++    observer_policy_profile_p0_owner_approval_sha256=(
++        "322df19ade75797fc4c3f43fe96e689404ef60a270c92081afea03683e734c91"
++    ),
++    observer_policy_status=("profile_P0_items_1_5_approved_runtime_items_6_8_pending"),
+     communication_mapping_id="issue2:kv-recovery-v1alpha1",
+-    communication_mapping_candidate_sha256=(
+-        "dca914f989f3a98d43fb9fa2538f7c43a375e8f22f5deb7e09343aee5ee7bc19"
++    communication_mapping_sha256=(
++        "095944bbbb1a3ad3518aebfdd61c820ade3affdebd6024b47389cdaec24a3fa3"
++    ),
++    communication_mapping_approval_candidate_sha256=(
++        "a686243ffd9c650790e6421e5f976a2a5c010a5d2480e7a30ad8722a9218f3f7"
++    ),
++    communication_mapping_authority_approval_sha256=(
++        "42b761177c4bea13833be19ddc143f89c32eee02fbbb98afc2c03249c2783fe5"
+     ),
++    communication_mapping_status="approved_mapping_only",
+     base_mode_overlay_id="rlp.trace-mode/kv-offload-v1alpha1",
+-    base_mode_overlay_candidate_sha256=(
+-        "6e035c29664038cdc93b545538cee6fc31abfb79e455d994851f8c9dbfd1c734"
++    base_mode_overlay_sha256=(
++        "d80771b793a9513cdbd4fc2001e21771c56a59d49340ee88d4381027d70b1d5a"
++    ),
++    base_mode_overlay_approval_candidate_sha256=(
++        "de889357af659d8e9c1f7daf0aa32656761e80dcf0fea29ef60809912f513694"
++    ),
++    base_mode_overlay_owner_approval_sha256=(
++        "50d7deb8f98fcdca36303297a4ce6f7958ae619574d2e1994872936b6fc583a3"
++    ),
++    base_mode_overlay_status="approved_overlay_only",
++    g0_remediation_cpu_result_sha256=(
++        "4b378d10cef6be10fa3fb5a840402da77b1da755781118127a5d30b1cc4b7eb2"
+     ),
++    g1_cpu_source_reauthorization_sha256=(
++        "448ff68cd139077a2f767fd16359bb5dd8f4cf61cfe258fd48f53a26569718f5"
++    ),
++    complete_configuration_status="pending",
++    runtime_conformance_status="pending",
++    joint_admission_status="pending",
+     runtime_commit="f229ba7cad21a4dba58681af6738a9fd947388e2",
+     device_plugin_audit_commit=("cafad89a5e103f31ea517c1edb56130578c3cd56"),
+-    communication_mapping_status="candidate_issue2_authority_pending",
+-    base_mode_overlay_status="candidate_owner_ratification_pending",
+     communication_mode="none",
+     runtime_activation_authorized=False,
+ )
+@@ -111,8 +164,12 @@ def _activation_gate_open() -> bool:
+     return (
+         KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
+         and binding.runtime_activation_authorized
+-        and binding.communication_mapping_status == "approved"
+-        and binding.base_mode_overlay_status == "approved"
++        and binding.communication_mapping_status == "approved_mapping_only"
++        and binding.base_mode_overlay_status == "approved_overlay_only"
++        and binding.observer_policy_status == "fully_ratified"
++        and binding.complete_configuration_status == "approved"
++        and binding.runtime_conformance_status == "conformant"
++        and binding.joint_admission_status == "approved"
+         and binding.communication_mode == binding.communication_mapping_id
+     )
+ 
+@@ -377,6 +434,12 @@ class KVRecoveryWaitAttempt:
+ class KVRecoverySchedulerObserver(Protocol):
+     """Scheduler-side identity and receipt observer supplied by a plugin."""
+ 
++    def request_preempted(
++        self,
++        runtime_request_id: str,
++        recovery_epoch: int,
++    ) -> None: ...
++
+     def prepare_transfer_context(
+         self,
+         runtime_request_id: str,
+@@ -387,9 +450,23 @@ class KVRecoverySchedulerObserver(Protocol):
+     def consume_h2d_receipts(
+         self,
+         receipts: tuple[KVRecoveryH2DReceipt, ...],
+-        receipts_truncated: bool,
++        receipt_capacity_exhausted: bool,
++    ) -> None: ...
++
++    def request_admission_started(
++        self,
++        runtime_request_id: str,
++        recovery_epoch: int,
++    ) -> None: ...
++
++    def request_admitted(
++        self,
++        runtime_request_id: str,
++        recovery_epoch: int,
+     ) -> None: ...
+ 
++    def request_terminal(self, runtime_request_id: str) -> None: ...
++
+     def reset(self, stale_job_threshold: int) -> None: ...
+ 
+     def close(self) -> None: ...
+@@ -431,7 +508,11 @@ class KVRecoveryWorkerObserver(Protocol):
+ 
+     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
+ 
+-    def h2d_receipt_truncated(self, receipt: KVRecoveryH2DReceipt) -> None: ...
++    def h2d_receipt_capacity_exhausted(
++        self,
++        receipt: KVRecoveryH2DReceipt,
++        loss_reason: Literal["serialization_failure"],
++    ) -> None: ...
+ 
+     def close(self) -> None: ...
+ 
+@@ -460,10 +541,11 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
+         device_duration_ns: int | None,
+     ) -> KVRecoveryH2DReceipt | None: ...
+ 
+-    def pending_h2d_capacity_exhausted(
++    def transfer_capacity_exhausted(
+         self,
+         attempt: KVRecoveryTransferAttempt,
+-        timestamp_ns: int,
++        capacity: KVRecoveryCapacity,
++        timestamp_ns: int | None,
+         loss_reason: Literal["serialization_failure"],
+     ) -> None: ...
+ 
+@@ -477,7 +559,11 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
+ 
+     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
+ 
+-    def h2d_receipt_truncated(self, receipt: KVRecoveryH2DReceipt) -> None: ...
++    def h2d_receipt_capacity_exhausted(
++        self,
++        receipt: KVRecoveryH2DReceipt,
++        loss_reason: Literal["serialization_failure"],
++    ) -> None: ...
+ 
+     def close(
+         self,
+@@ -528,11 +614,21 @@ class BoundedKVRecoveryWorkerObserver:
+         self._lifecycle_lock = Lock()
+         self._state_lock = Lock()
+ 
++    @property
++    def prepared_transfer_count(self) -> int:
++        with self._state_lock:
++            return len(self._prepared_by_job_id)
++
+     @property
+     def pending_h2d_count(self) -> int:
+         with self._state_lock:
+             return len(self._pending_h2d_by_transfer_id)
+ 
++    @property
++    def pending_d2h_count(self) -> int:
++        with self._state_lock:
++            return len(self._pending_d2h_by_job_id)
++
+     @property
+     def transfer_seq(self) -> int:
+         with self._state_lock:
+@@ -549,6 +645,7 @@ class BoundedKVRecoveryWorkerObserver:
+         context: KVRecoveryTransferContext,
+     ) -> KVRecoveryTransferAttempt | None:
+         with self._lifecycle_lock:
++            capacity_exhausted = False
+             failure_reason: str | None = None
+             with self._state_lock:
+                 if self._closed:
+@@ -583,14 +680,21 @@ class BoundedKVRecoveryWorkerObserver:
+                     elif duplicate:
+                         failure_reason = "duplicate_connector_job_id"
+                     elif len(self._prepared_by_job_id) >= (
+-                        MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++                        MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS
+                     ):
+                         self._evidence_disabled = True
+-                        failure_reason = "prepared_transfer_capacity_exhausted"
++                        capacity_exhausted = True
+                     else:
+                         self._prepared_by_job_id[connector_job_id] = attempt
+                         return attempt
+-            if failure_reason is not None:
++            if capacity_exhausted and attempt is not None:
++                self._sink.transfer_capacity_exhausted(
++                    attempt=attempt,
++                    capacity="prepared_transfer",
++                    timestamp_ns=None,
++                    loss_reason="serialization_failure",
++                )
++            elif failure_reason is not None:
+                 self._sink.evidence_failure(
+                     reason=failure_reason,
+                     connector_job_ids=(
+@@ -624,7 +728,7 @@ class BoundedKVRecoveryWorkerObserver:
+         timestamp_ns: int,
+     ) -> None:
+         with self._lifecycle_lock:
+-            capacity_exhausted = False
++            capacity_exhausted: KVRecoveryCapacity | None = None
+             failure_reason: str | None = None
+             with self._state_lock:
+                 if self._closed:
+@@ -644,14 +748,14 @@ class BoundedKVRecoveryWorkerObserver:
+                     >= MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
+                 ):
+                     self._evidence_disabled = True
+-                    capacity_exhausted = True
++                    capacity_exhausted = "pending_h2d"
+                 elif (
+                     attempt.context.operation == "d2h_preserve"
+                     and len(self._pending_d2h_by_job_id)
+-                    >= MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++                    >= MAX_PENDING_D2H_CONTEXTS_PER_PROCESS
+                 ):
+                     self._evidence_disabled = True
+-                    failure_reason = "pending_d2h_capacity_exhausted"
++                    capacity_exhausted = "pending_d2h"
+                 else:
+                     pending = _PendingKVRecoveryTransfer(attempt, timestamp_ns)
+                     if attempt.context.operation == "h2d_restore":
+@@ -661,11 +765,12 @@ class BoundedKVRecoveryWorkerObserver:
+                         ] = attempt.transfer_id
+                     else:
+                         self._pending_d2h_by_job_id[attempt.connector_job_id] = pending
+-            if capacity_exhausted:
+-                self._sink.pending_h2d_capacity_exhausted(
+-                    attempt,
+-                    timestamp_ns,
+-                    "serialization_failure",
++            if capacity_exhausted is not None:
++                self._sink.transfer_capacity_exhausted(
++                    attempt=attempt,
++                    capacity=capacity_exhausted,
++                    timestamp_ns=timestamp_ns,
++                    loss_reason="serialization_failure",
+                 )
+             elif failure_reason is not None:
+                 self._sink.evidence_failure(
+@@ -889,12 +994,17 @@ class BoundedKVRecoveryWorkerObserver:
+                     return
+             self._sink.wait_completed(attempt)
+ 
+-    def h2d_receipt_truncated(self, receipt: KVRecoveryH2DReceipt) -> None:
++    def h2d_receipt_capacity_exhausted(
++        self,
++        receipt: KVRecoveryH2DReceipt,
++        loss_reason: Literal["serialization_failure"],
++    ) -> None:
+         with self._lifecycle_lock:
+             with self._state_lock:
+                 if self._closed:
+                     return
+-            self._sink.h2d_receipt_truncated(receipt)
++                self._evidence_disabled = True
++            self._sink.h2d_receipt_capacity_exhausted(receipt, loss_reason)
+ 
+     def close(self) -> None:
+         with self._lifecycle_lock:
+-- 
+2.53.0.windows.3
+
