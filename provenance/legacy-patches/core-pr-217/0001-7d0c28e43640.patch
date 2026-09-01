@@ -1,0 +1,284 @@
+From 7d0c28e436407821315504518009c1cfeb0daa3a Mon Sep 17 00:00:00 2001
+From: Xie Hanlong <xiehanlong834@hust.edu.cn>
+Date: Tue, 4 Aug 2026 14:19:10 +0800
+Subject: [PATCH] feat: B134 event instrumentation + transfer phase timers
+ (env-gated)
+
+- 6-event contract chain (preempt/restore_start/restore_done/wakeup/admission/scheduled) to JSONL when B134_EVENTS_FILE is set (zero overhead otherwise)
+- transfer phase timers: desc (packing/index), sync, submit, copy (wall-clock; event elapsed is unreliable on Ascend swap_blocks_batch)
+- host-residency timers (cpu_store/cpu_evict), scheduler-step timer (sched_step)
+---
+ vllm/v1/b134_events.py                | 14 ++++++++++++++
+ vllm/v1/core/sched/scheduler.py       |  5 +++++
+ vllm/v1/kv_offload/cpu/manager.py     |  6 ++++++
+ vllm/v1/kv_offload/cpu/npu_worker.py  | 19 +++++++++++++++++++
+ vllm/v1/kv_offload/tiering/manager.py |  8 ++++++++
+ 5 files changed, 52 insertions(+)
+ create mode 100644 vllm/v1/b134_events.py
+
+diff --git a/vllm/v1/b134_events.py b/vllm/v1/b134_events.py
+new file mode 100644
+index 00000000000..f40a60c8a1b
+--- /dev/null
++++ b/vllm/v1/b134_events.py
+@@ -0,0 +1,14 @@
++"""B134 event emitter (minimal, observe-only instrumentation)."""
++import os
++import time
++
++_FILE = os.environ.get("B134_EVENTS_FILE", "")
++
++if _FILE:
++    _f = open(_FILE, "a", buffering=1)  # line-buffered
++
++
++def emit(event: str, req_id: str, extra: str = "") -> None:
++    if not _FILE:
++        return
++    _f.write(f"{time.monotonic():.6f}\t{event}\t{req_id}\t{extra}\n")
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 58987cdfae8..88d3ff358b6 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -8,6 +8,7 @@ from dataclasses import replace
+ from typing import Any
+ 
+ import numpy as np
++from vllm.v1.b134_events import emit  # B134
+ 
+ from vllm.compilation.cuda_graph import CUDAGraphStat
+ from vllm.config import VllmConfig
+@@ -1025,14 +1026,17 @@ class Scheduler(SchedulerInterface):
+                     continue
+ 
+                 self.running.append(request)
++                emit("admission", request.request_id)
+                 if self.log_stats:
+                     request.record_event(
+                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
+                     )
++                    emit("scheduled", request.request_id)
+                 if request.status == RequestStatus.WAITING:
+                     scheduled_new_reqs.append(request)
+                 elif request.status == RequestStatus.PREEMPTED:
+                     scheduled_resumed_reqs.append(request)
++                    emit("wakeup", request.request_id)
+                 else:
+                     raise RuntimeError(f"Invalid request status: {request.status}")
+ 
+@@ -1209,6 +1213,7 @@ class Scheduler(SchedulerInterface):
+         request.num_preemptions += 1
+         if self.log_stats:
+             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
++            emit("preempt", request.request_id)
+ 
+         # Put the request back to the waiting queue.
+         self.waiting.prepend_request(request)
+diff --git a/vllm/v1/kv_offload/cpu/manager.py b/vllm/v1/kv_offload/cpu/manager.py
+index e5d7df9b05b..b75091cbdae 100644
+--- a/vllm/v1/kv_offload/cpu/manager.py
++++ b/vllm/v1/kv_offload/cpu/manager.py
+@@ -24,6 +24,8 @@ from vllm.v1.kv_offload.cpu.common import (
+     CPUOffloadingMetrics,
+ )
+ from vllm.v1.kv_offload.cpu.policies.arc import ARCCachePolicy
++import time
++from vllm.v1.b134_events import emit  # B134
+ from vllm.v1.kv_offload.cpu.policies.base import BlockStatus, CachePolicy
+ from vllm.v1.kv_offload.cpu.policies.lru import LRUCachePolicy
+ 
+@@ -179,6 +181,7 @@ class CPUOffloadingManager(OffloadingManager):
+         keys: Collection[OffloadKey],
+         req_context: ReqContext,
+     ) -> PrepareStoreOutput | None:
++        _t0 = time.monotonic()  # B134
+         if self.counts is not None:
+             num_keys = len(keys)
+             keys = [k for k in keys if self.counts.get(k, 0) >= self.store_threshold]
+@@ -243,6 +246,7 @@ class CPUOffloadingManager(OffloadingManager):
+             store_spec=store_spec,
+             evicted_keys=to_evict,
+         )
++        emit("cpu_store", req_context.req_id, f"us={(time.monotonic() - _t0) * 1e6:.0f} n={len(keys_to_store)} evict={len(to_evict)}")
+ 
+     @override
+     def complete_store(
+@@ -279,6 +283,7 @@ class CPUOffloadingManager(OffloadingManager):
+ 
+     def evict_keys(self, keys: Collection[OffloadKey]) -> list[OffloadKey]:
+         """Explicitly evict ready, unreferenced blocks from the CPU tier."""
++        _t0 = time.monotonic()  # B134
+         evicted: list[OffloadKey] = []
+         for key in keys:
+             block = self._policy.get(key)
+@@ -298,6 +303,7 @@ class CPUOffloadingManager(OffloadingManager):
+                     removed=True,
+                 )
+             )
++        emit("cpu_evict", "cpu", f"us={(time.monotonic() - _t0) * 1e6:.0f} n={len(evicted)}")
+         return evicted
+ 
+     @override
+diff --git a/vllm/v1/kv_offload/cpu/npu_worker.py b/vllm/v1/kv_offload/cpu/npu_worker.py
+index ebc4f17dccb..a2f2e1af3d4 100644
+--- a/vllm/v1/kv_offload/cpu/npu_worker.py
++++ b/vllm/v1/kv_offload/cpu/npu_worker.py
+@@ -2,6 +2,8 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import os
++import time
++from vllm.v1.b134_events import emit  # B134
+ from collections import deque
+ from dataclasses import dataclass
+ from typing import Any
+@@ -40,6 +42,7 @@ class NPUTransfer:
+     dma_dst: torch.Tensor | None = None
+     dma_sizes: torch.Tensor | None = None
+     staging_buffer: torch.Tensor | None = None
++    submitted_at: float = 0.0  # B134 wall-clock submit timestamp
+ 
+ 
+ def _get_torch_npu() -> Any:
+@@ -206,6 +209,7 @@ class AscendSingleDirectionOffloadingHandler:
+         self, job_id: int, src_spec: LoadStoreSpec, dst_spec: LoadStoreSpec
+     ) -> bool:
+         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
++        _t0 = time.monotonic()  # B134
+         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
+ 
+         src_blocks = src_spec.block_ids
+@@ -292,6 +296,7 @@ class AscendSingleDirectionOffloadingHandler:
+         assert src_offset == len(src_blocks)
+         assert dst_offset == len(dst_blocks)
+         assert op_idx == num_copy_ops
++        _t_desc = time.monotonic()  # B134 (descriptors/packing/index-remap done)
+ 
+         npu = _get_torch_npu()
+         start_event = self._new_event()
+@@ -305,6 +310,7 @@ class AscendSingleDirectionOffloadingHandler:
+             self._stream.wait_stream(npu.current_stream())
+         if self._transfers:
+             self._stream.wait_event(self._transfers[-1].end_event)
++        _t_sync = time.monotonic()  # B134 (stream sync done)
+ 
+         if num_copy_ops and not self.npu_to_cpu:
+             max_page_bytes = int(all_sizes.max())
+@@ -331,19 +337,23 @@ class AscendSingleDirectionOffloadingHandler:
+             start_event.record(self._stream)
+             if num_copy_ops:
+                 if self.npu_to_cpu:
++                    _t_sw = time.monotonic()  # B134
+                     torch.ops._C_ascend.swap_blocks_batch(src, dst, sizes, 1)
++                    emit("swap_d2h", f"job{job_id}", f"n={num_copy_ops} us={(time.monotonic() - _t_sw) * 1e6:.0f}")
+                 else:
+                     assert staging_buffer is not None
+                     assert dma_src is not None
+                     assert dma_dst is not None
+                     assert dma_sizes is not None
+                     dma_offset = 0
++                    _t_gather_total = 0.0  # B134
+                     for chunk_start, chunk_end in _iter_transfer_chunks(
+                         all_sizes,
+                         self._staging_capacity_bytes,
+                     ):
+                         chunk_src = all_src[chunk_start:chunk_end]
+                         chunk_sizes = all_sizes[chunk_start:chunk_end]
++                        _tg0 = time.monotonic()  # B134
+                         chunk_dma_ops = _coalesce_host_pages(
+                             chunk_src,
+                             chunk_sizes,
+@@ -352,6 +362,7 @@ class AscendSingleDirectionOffloadingHandler:
+                             all_dma_dst[dma_offset:],
+                             all_dma_sizes[dma_offset:],
+                         )
++                        _t_gather_total += time.monotonic() - _tg0  # B134
+                         offsets = (
+                             chunk_sizes.cumsum(dtype=chunk_sizes.dtype) - chunk_sizes
+                         )
+@@ -371,7 +382,10 @@ class AscendSingleDirectionOffloadingHandler:
+                         )
+                         dma_offset = dma_end
+                     num_dma_ops = dma_offset
++                    emit("gather_h2d", f"job{job_id}", f"us={_t_gather_total * 1e6:.0f} chunks={num_dma_ops}")
+             end_event.record(self._stream)
++        _t_submit = time.monotonic()  # B134
++        emit("transfer_phase", f"job{job_id}", f"dir={'d2h' if self.npu_to_cpu else 'h2d'} bytes={num_transfer_bytes} n_ops={num_copy_ops} desc_us={(_t_desc - _t0) * 1e6:.0f} sync_us={(_t_sync - _t_desc) * 1e6:.0f} submit_us={(_t_submit - _t_sync) * 1e6:.0f}")
+ 
+         if num_copy_ops and not self.npu_to_cpu:
+             logger.debug(
+@@ -396,6 +410,7 @@ class AscendSingleDirectionOffloadingHandler:
+                 dma_dst=dma_dst,
+                 dma_sizes=dma_sizes,
+                 staging_buffer=staging_buffer,
++                submitted_at=_t_submit,
+             )
+         )
+         return True
+@@ -404,6 +419,10 @@ class AscendSingleDirectionOffloadingHandler:
+         results: list[TransferResult] = []
+         while self._transfers and self._transfers[0].end_event.query():
+             transfer = self._transfers.popleft()
++            transfer.end_event.synchronize()  # B134: ensure completion ts is real
++            _wall_ms = (time.monotonic() - transfer.submitted_at) * 1e3
++            _evt_ms = transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
++            emit("copy_done", f"job{transfer.job_id}", f"dir={'d2h' if self.npu_to_cpu else 'h2d'} bytes={transfer.num_bytes} copy_ms_wall={_wall_ms:.3f} copy_ms_event={_evt_ms:.3f} note=wall_authoritative")
+             results.append(
+                 TransferResult(
+                     job_id=transfer.job_id,
+diff --git a/vllm/v1/kv_offload/tiering/manager.py b/vllm/v1/kv_offload/tiering/manager.py
+index 1ad89dfb388..a61ca02df65 100644
+--- a/vllm/v1/kv_offload/tiering/manager.py
++++ b/vllm/v1/kv_offload/tiering/manager.py
+@@ -61,6 +61,7 @@ from vllm.v1.kv_offload.tiering.lifecycle import (
+     has_stable_session_id,
+ )
+ from vllm.v1.kv_offload.tiering.residency import TieringMetrics
++from vllm.v1.b134_events import emit  # B134
+ 
+ logger = init_logger(__name__)
+ 
+@@ -885,6 +886,7 @@ class TieringOffloadingManager(OffloadingManager):
+         Returns:
+             LoadStoreSpec for reading from primary tier.
+         """
++        emit("restore_start", req_context.req_id, str(len(keys)))
+         self._lifecycle.record_request_keys(req_context, keys)
+         # Process completed promotions to ensure blocks are ready
+         self._maybe_process_finished_jobs()
+@@ -920,6 +922,7 @@ class TieringOffloadingManager(OffloadingManager):
+             keys: Blocks that finished loading.
+             req_context: Per-request context.
+         """
++        emit("restore_done", req_context.req_id, str(len(keys)))
+         self.primary_tier.complete_load(keys, req_context)
+         if self._track_residency:
+             self._lifecycle.residency.finish_transfer(keys, "cpu", "device")
+@@ -957,7 +960,10 @@ class TieringOffloadingManager(OffloadingManager):
+         # Cascading of these newly-stored blocks to ALL secondary tiers
+         # happens later in complete_store(), after the GPU→Primary transfer
+         # completes.
++        _t_ev = time.monotonic()  # B134
+         primary_result = self.primary_tier.prepare_store(keys, req_context)
++        if primary_result is not None:
++            emit("evict", req_context.req_id, f"n={len(primary_result.evicted_keys)} us={(time.monotonic() - _t_ev) * 1e6:.0f}")
+ 
+         if primary_result is None:
+             return None
+@@ -1289,11 +1295,13 @@ class TieringOffloadingManager(OffloadingManager):
+         Called once per scheduler step from
+         OffloadingConnectorScheduler.build_connector_meta().
+         """
++        _t0 = time.monotonic()  # B134
+         self._maybe_process_finished_jobs()
+         self._processed_jobs_this_step = False
+         self._flush_pending_promotions()
+         for tier in self.secondary_tiers:
+             tier.on_schedule_end(context)
++        emit("sched_step", "step", f"us={(time.monotonic() - _t0) * 1e6:.0f}")
+ 
+         protected_keys = {
+             key for metadata in self._transfer_jobs.values() for key in metadata.keys
+-- 
+2.53.0.windows.3
+

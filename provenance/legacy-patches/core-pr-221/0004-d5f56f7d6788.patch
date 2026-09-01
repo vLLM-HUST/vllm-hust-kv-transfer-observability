@@ -1,0 +1,966 @@
+From d5f56f7d678864dc266e7e25c91f08787cc38d15 Mon Sep 17 00:00:00 2001
+From: Remby Lis <153624059+Remygred@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 15:57:09 +0000
+Subject: [PATCH] feat: complete default-off KV recovery evidence sidecars
+
+Assisted-by: OpenAI Codex
+---
+ .../test_kv_recovery_scheduler.py             |  62 ++++++++
+ .../test_kv_recovery_worker.py                |  78 ++++++++++
+ .../test_worker_metadata.py                   |   1 +
+ tests/v1/test_kv_recovery_profile.py          |  59 +++++++
+ .../kv_transfer/kv_connector/v1/base.py       |   4 +
+ .../kv_connector/v1/offloading/common.py      |   2 +
+ .../kv_connector/v1/offloading/scheduler.py   |  32 +++-
+ .../kv_connector/v1/offloading/worker.py      |  49 ++++++
+ .../kv_connector/v1/offloading_connector.py   |  27 ++++
+ vllm/v1/core/sched/scheduler.py               |  25 +++
+ vllm/v1/kv_recovery_profile.py                | 144 +++++++++++++++++-
+ 11 files changed, 479 insertions(+), 4 deletions(-)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+index e7828393e7..13c893ab7b 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import hashlib
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+@@ -21,6 +22,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+ )
+ from vllm.v1.kv_recovery_profile import (
+     KV_RECOVERY_PROFILE_BINDING,
++    KVRecoveryComputeContext,
+     KVRecoveryH2DReceipt,
+     KVRecoveryIdentity,
+     KVRecoveryLogicalBlock,
+@@ -43,6 +45,7 @@ class RecordingSchedulerObserver:
+         self.preemptions: list[tuple[str, int]] = []
+         self.admission_starts: list[tuple[str, int]] = []
+         self.admissions: list[tuple[str, int]] = []
++        self.requeues: list[tuple[str, int, str]] = []
+         self.terminals: list[str] = []
+         self.runtime_events: list[tuple[str, str, int | None]] = []
+         self.receipt_ready_request_ids: set[str] = set()
+@@ -52,6 +55,7 @@ class RecordingSchedulerObserver:
+     def request_preempted(self, runtime_request_id, recovery_epoch):
+         self.preemptions.append((runtime_request_id, recovery_epoch))
+         self.runtime_events.append(("preempted", runtime_request_id, recovery_epoch))
++        return f"{'b' * 32}:k:0"
+ 
+     def prepare_transfer_context(self, runtime_request_id, operation, coordinates):
+         self.runtime_events.append((operation, runtime_request_id, None))
+@@ -66,6 +70,7 @@ class RecordingSchedulerObserver:
+             recovery_epoch=1 if is_recovery else None,
+             episode_id=f"{lifecycle_id}:k:1" if is_recovery else None,
+             base_preempted_event_id=(f"{'b' * 32}:e:0" if is_recovery else None),
++            preempt_profile_record_id=(f"{'b' * 32}:k:0" if is_recovery else None),
+         )
+         logical_blocks = tuple(
+             KVRecoveryLogicalBlock(
+@@ -121,6 +126,24 @@ class RecordingSchedulerObserver:
+     def request_admitted(self, runtime_request_id, recovery_epoch):
+         self.admissions.append((runtime_request_id, recovery_epoch))
+         self.runtime_events.append(("admitted", runtime_request_id, recovery_epoch))
++        receipt = next(
++            receipt
++            for batch, _truncated in reversed(self.receipt_batches)
++            for receipt in batch
++            if receipt.identity.runtime_request_id == runtime_request_id
++        )
++        return KVRecoveryComputeContext(
++            binding=receipt.binding,
++            identity=receipt.identity,
++            transfer_id=receipt.transfer_id,
++            block_set_id=receipt.block_set_id,
++            bytes_moved=receipt.bytes_moved,
++            admission_profile_record_id=f"{'b' * 32}:k:1",
++        )
++
++    def request_requeued(self, runtime_request_id, recovery_epoch, reason):
++        self.requeues.append((runtime_request_id, recovery_epoch, reason))
++        self.runtime_events.append(("requeued", runtime_request_id, recovery_epoch))
+ 
+     def request_terminal(self, runtime_request_id):
+         self.terminals.append(runtime_request_id)
+@@ -139,6 +162,10 @@ class RecordingWorkerObserver:
+         self.contexts: list[KVRecoveryTransferContext] = []
+         self.transfer_seq = 0
+         self.waits: list[KVRecoveryWaitAttempt] = []
++        self.first_compute_observations: list[
++            tuple[KVRecoveryComputeContext, int, str, str]
++        ] = []
++        self.missing_first_compute: list[KVRecoveryComputeContext] = []
+ 
+     def begin_transfer(self, connector_job_id, context):
+         attempt = KVRecoveryTransferAttempt(
+@@ -202,6 +229,14 @@ class RecordingWorkerObserver:
+     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         raise AssertionError("receipt capacity unexpectedly exhausted")
+ 
++    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
++        self.first_compute_observations.append(
++            (context, timestamp_ns, compute_kind, base_event_id)
++        )
++
++    def first_compute_not_observed(self, context):
++        self.missing_first_compute.append(context)
++
+     def close(self):
+         return None
+ 
+@@ -355,6 +390,15 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
+     assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
+     assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
+     assert factory.scheduler.admissions == [(runtime_request_id, 1)]
++    connector_worker = runner.worker_connector.connector_worker
++    assert connector_worker is not None
++    compute_contexts = connector_worker._kv_recovery_compute_contexts
++    assert compute_contexts is not None
++    assert compute_contexts == {}
++    assert [
++        context.identity.runtime_request_id
++        for context in factory.worker.missing_first_compute
++    ] == [runtime_request_id]
+     event_names = [
+         event_name
+         for event_name, request_id, _ in factory.scheduler.runtime_events
+@@ -393,6 +437,24 @@ def test_scheduler_observer_failure_is_fail_open(
+     assert factory.scheduler.terminals == ["0"]
+ 
+ 
++def test_post_wakeup_requeue_requires_matching_ready_epoch():
++    observer = RecordingSchedulerObserver()
++    scheduler = object.__new__(scheduler_module.OffloadingConnectorScheduler)
++    scheduler._kv_recovery_observer = observer
++    scheduler._kv_recovery_receipt_ready = {"request-0": 1}
++    scheduler._req_status = {
++        "request-0": SimpleNamespace(
++            req=SimpleNamespace(num_preemptions=1),
++        )
++    }
++
++    scheduler.observe_kv_recovery_requeue("request-0", "block_capacity")
++    scheduler._req_status["request-0"].req.num_preemptions = 2
++    scheduler.observe_kv_recovery_requeue("request-0", "token_budget")
++
++    assert observer.requeues == [("request-0", 1, "block_capacity")]
++
++
+ def test_malformed_scheduler_observer_return_is_fail_open(
+     request_runner,
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+index 07ea0c33ab..ace7b438cb 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+@@ -26,6 +26,7 @@ from vllm.v1.kv_recovery_profile import (
+     MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
+     MAX_TRANSFER_IDS_PER_WAIT_SET,
+     BoundedKVRecoveryWorkerObserver,
++    KVRecoveryComputeContext,
+     KVRecoveryH2DReceipt,
+     KVRecoveryIdentity,
+     KVRecoveryLogicalBlock,
+@@ -87,6 +88,8 @@ class RecordingObserver:
+         self.transfer_seq = 0
+         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
+         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
++        self.first_compute_observations: list[tuple[object, int, str, str]] = []
++        self.missing_first_compute: list[object] = []
+         self.closed = False
+ 
+     def _raise_if_requested(self, stage: str):
+@@ -173,6 +176,14 @@ class RecordingObserver:
+     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         self.receipt_capacity_losses.append((receipt, loss_reason))
+ 
++    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
++        self.first_compute_observations.append(
++            (context, timestamp_ns, compute_kind, base_event_id)
++        )
++
++    def first_compute_not_observed(self, context):
++        self.missing_first_compute.append(context)
++
+     def close(self):
+         self._raise_if_requested("close")
+         self.closed = True
+@@ -190,6 +201,7 @@ class RecordingEvidenceSink:
+         self.waits: list[KVRecoveryWaitAttempt] = []
+         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
+         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
++        self.first_compute_observations: list[tuple[object, int, str, str]] = []
+ 
+     def transfer_submitted(self, attempt, timestamp_ns):
+         self.submissions.append((attempt, timestamp_ns))
+@@ -254,6 +266,11 @@ class RecordingEvidenceSink:
+     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         self.receipt_capacity_losses.append((receipt, loss_reason))
+ 
++    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
++        self.first_compute_observations.append(
++            (context, timestamp_ns, compute_kind, base_event_id)
++        )
++
+     def close(self, open_attempts, evidence_disabled):
+         self.close_calls.append((open_attempts, evidence_disabled))
+ 
+@@ -270,6 +287,7 @@ def make_context(operation: str) -> KVRecoveryTransferContext:
+         recovery_epoch=1 if is_recovery else None,
+         episode_id=f"{lifecycle_id}:k:1" if is_recovery else None,
+         base_preempted_event_id=f"{'b' * 32}:e:0" if is_recovery else None,
++        preempt_profile_record_id=f"{'b' * 32}:k:0" if is_recovery else None,
+     )
+     logical_blocks = (KVRecoveryLogicalBlock(0, 0, "b" * 32),)
+     return KVRecoveryTransferContext(
+@@ -291,6 +309,18 @@ def make_load_job() -> TransferJob:
+     )
+ 
+ 
++def make_compute_context() -> KVRecoveryComputeContext:
++    transfer_context = make_context("h2d_restore")
++    return KVRecoveryComputeContext(
++        binding=transfer_context.binding,
++        identity=transfer_context.identity,
++        transfer_id=f"{'a' * 32}:t:0",
++        block_set_id=transfer_context.block_set_id,
++        bytes_moved=128,
++        admission_profile_record_id=f"{'b' * 32}:k:1",
++    )
++
++
+ def make_store_job() -> TransferJob:
+     return TransferJob(
+         req_id="request-0",
+@@ -316,13 +346,16 @@ def metadata(
+     store_jobs: Iterable[tuple[int, TransferJob]] = (),
+     jobs_to_flush: set[int] | None = None,
+     kv_recovery_contexts: Iterable[tuple[int, KVRecoveryTransferContext]] = (),
++    kv_recovery_compute_contexts: Iterable[tuple[str, KVRecoveryComputeContext]] = (),
+ ) -> OffloadingConnectorMetadata:
+     contexts = dict(kv_recovery_contexts)
++    compute_contexts = dict(kv_recovery_compute_contexts)
+     return OffloadingConnectorMetadata(
+         load_jobs=dict(load_jobs),
+         store_jobs=dict(store_jobs),
+         jobs_to_flush=jobs_to_flush,
+         kv_recovery_contexts=contexts or None,
++        kv_recovery_compute_contexts=compute_contexts or None,
+     )
+ 
+ 
+@@ -341,17 +374,62 @@ def test_transfer_job_remains_backward_compatible():
+ def test_connector_metadata_sidecar_round_trips_and_defaults_off():
+     job = make_load_job()
+     context = make_context("h2d_restore")
++    compute_context = make_compute_context()
+     disabled = metadata(load_jobs=((7, job),))
+     active = metadata(
+         load_jobs=((7, job),),
+         kv_recovery_contexts=((7, context),),
++        kv_recovery_compute_contexts=(("request-0", compute_context),),
+     )
+ 
+     disabled_copy = pickle.loads(pickle.dumps(disabled))
+     active_copy = pickle.loads(pickle.dumps(active))
+ 
+     assert disabled_copy.kv_recovery_contexts is None
++    assert disabled_copy.kv_recovery_compute_contexts is None
+     assert active_copy.kv_recovery_contexts == {7: context}
++    assert active_copy.kv_recovery_compute_contexts == {"request-0": compute_context}
++
++
++def test_worker_first_compute_consumes_exact_admitted_roster_once():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, _backend, _events = make_worker(observer)
++    context = make_compute_context()
++    worker.start_kv_transfers(
++        metadata(
++            kv_recovery_compute_contexts=(("request-0", context),),
++        )
++    )
++
++    worker.observe_kv_recovery_first_compute(
++        "request-0", 2, 199, "prefill", f"{'d' * 32}:e:0"
++    )
++    assert observer.first_compute_observations == []
++    worker.observe_kv_recovery_first_compute(
++        "request-0", 1, 200, "prefill", f"{'d' * 32}:e:0"
++    )
++    worker.observe_kv_recovery_first_compute(
++        "request-0", 1, 201, "prefill", f"{'d' * 32}:e:0"
++    )
++
++    assert observer.first_compute_observations == [
++        (context, 200, "prefill", f"{'d' * 32}:e:0")
++    ]
++
++
++def test_worker_marks_unconsumed_compute_sidecar_failed_on_next_step():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, _backend, _events = make_worker(observer)
++    context = make_compute_context()
++    worker.start_kv_transfers(
++        metadata(kv_recovery_compute_contexts=(("request-0", context),))
++    )
++
++    worker.start_kv_transfers(metadata())
++
++    assert observer.missing_first_compute == [context]
+ 
+ 
+ def test_disabled_worker_path_preserves_load_semantics():
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py b/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
+index 188cba9e3f..51ae5c6f87 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
+@@ -29,6 +29,7 @@ def make_receipt(job_id: int = 42) -> KVRecoveryH2DReceipt:
+         recovery_epoch=1,
+         episode_id=f"{lifecycle_id}:k:1",
+         base_preempted_event_id=f"{'b' * 32}:e:0",
++        preempt_profile_record_id=f"{'b' * 32}:k:0",
+     )
+     return KVRecoveryH2DReceipt(
+         binding=KV_RECOVERY_PROFILE_BINDING,
+diff --git a/tests/v1/test_kv_recovery_profile.py b/tests/v1/test_kv_recovery_profile.py
+index 51c3fb2487..d066614827 100644
+--- a/tests/v1/test_kv_recovery_profile.py
++++ b/tests/v1/test_kv_recovery_profile.py
+@@ -22,6 +22,7 @@ from vllm.v1.kv_recovery_profile import (
+     MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS,
+     BoundedKVRecoveryWorkerObserver,
+     KVRecoveryBlockCoordinate,
++    KVRecoveryComputeContext,
+     KVRecoveryH2DReceipt,
+     KVRecoveryIdentity,
+     KVRecoveryLogicalBlock,
+@@ -59,6 +60,7 @@ def make_identity(*, recovery: bool = True) -> KVRecoveryIdentity:
+         recovery_epoch=1 if recovery else None,
+         episode_id=f"{lifecycle_id}:k:1" if recovery else None,
+         base_preempted_event_id=f"{'b' * 32}:e:0" if recovery else None,
++        preempt_profile_record_id=f"{'b' * 32}:k:0" if recovery else None,
+     )
+ 
+ 
+@@ -132,6 +134,7 @@ class NoopEvidenceSink:
+     def __init__(self):
+         self.failures: list[str] = []
+         self.close_calls = 0
++        self.first_compute_observations: list[tuple[object, int, str, str]] = []
+ 
+     def transfer_submitted(self, attempt, timestamp_ns):
+         return None
+@@ -166,6 +169,11 @@ class NoopEvidenceSink:
+     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         return None
+ 
++    def first_compute(self, context, timestamp_ns, compute_kind, base_event_id):
++        self.first_compute_observations.append(
++            (context, timestamp_ns, compute_kind, base_event_id)
++        )
++
+     def close(self, open_attempts, evidence_disabled):
+         self.close_calls += 1
+ 
+@@ -273,9 +281,60 @@ def test_recovery_abi_round_trips_through_pickle():
+         transfer_id=f"{'a' * 32}:t:0",
+         context=context,
+     )
++    compute_context = KVRecoveryComputeContext(
++        binding=context.binding,
++        identity=context.identity,
++        transfer_id=attempt.transfer_id,
++        block_set_id=context.block_set_id,
++        bytes_moved=128,
++        admission_profile_record_id=f"{'b' * 32}:k:1",
++    )
+ 
+     assert pickle.loads(pickle.dumps(context)) == context
+     assert pickle.loads(pickle.dumps(attempt)) == attempt
++    assert pickle.loads(pickle.dumps(compute_context)) == compute_context
++
++
++def test_first_compute_requires_exact_context_and_base_event():
++    context = make_context()
++    compute_context = KVRecoveryComputeContext(
++        binding=context.binding,
++        identity=context.identity,
++        transfer_id=f"{PROCESS_UUID}:t:0",
++        block_set_id=context.block_set_id,
++        bytes_moved=128,
++        admission_profile_record_id=f"{'b' * 32}:k:1",
++    )
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++
++    observer.first_compute(
++        compute_context,
++        20,
++        "prefill",
++        f"{'d' * 32}:e:0",
++    )
++    assert sink.first_compute_observations == [
++        (compute_context, 20, "prefill", f"{'d' * 32}:e:0")
++    ]
++
++    invalid_sink = NoopEvidenceSink()
++    invalid_observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, invalid_sink
++    )
++    invalid_observer.first_compute(compute_context, 20, "prefill", "not-an-event")
++    assert invalid_observer.evidence_disabled
++    assert invalid_sink.failures == ["invalid_first_compute_observation"]
++
++    missing_sink = NoopEvidenceSink()
++    missing_observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, missing_sink
++    )
++    missing_observer.first_compute_not_observed(compute_context)
++    assert missing_observer.evidence_disabled
++    assert missing_sink.failures == ["missing_first_compute_observation"]
+ 
+ 
+ def test_context_rejects_coordinate_or_digest_drift():
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index 4ffb2f6e32..1f911d63b2 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -529,6 +529,10 @@ class KVConnectorBase_V1(ABC):
+         """
+         return
+ 
++    def observe_kv_recovery_requeue(self, request: "Request", reason: str) -> None:
++        """Optional default-off observation of a post-wakeup scheduler defer."""
++        return
++
+     def update_connector_output(self, connector_output: KVConnectorOutput):
+         """
+         Update KVConnector state from worker-side connectors output.
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+index 7eb0f58132..904ad3a16d 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+@@ -9,6 +9,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+ from vllm.v1.kv_offload.base import LoadStoreSpec
+ from vllm.v1.kv_recovery_profile import (
+     MAX_H2D_RECEIPTS_PER_WORKER_STEP,
++    KVRecoveryComputeContext,
+     KVRecoveryH2DReceipt,
+     KVRecoveryTransferContext,
+ )
+@@ -76,6 +77,7 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
+     store_jobs: dict[int, TransferJob]
+     jobs_to_flush: set[int] | None = None
+     kv_recovery_contexts: dict[int, KVRecoveryTransferContext] | None = None
++    kv_recovery_compute_contexts: dict[str, KVRecoveryComputeContext] | None = None
+ 
+ 
+ @dataclass
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index fc7a4b943e..7b3e716eb4 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -49,8 +49,10 @@ from vllm.v1.kv_offload.base import (
+ from vllm.v1.kv_recovery_profile import (
+     MAX_LOGICAL_BLOCKS_PER_SET,
+     KVRecoveryBlockCoordinate,
++    KVRecoveryComputeContext,
+     KVRecoveryH2DReceipt,
+     KVRecoveryOperation,
++    KVRecoveryRequeueReason,
+     KVRecoverySchedulerObserver,
+     KVRecoveryTransferContext,
+ )
+@@ -434,6 +436,23 @@ class OffloadingConnectorScheduler:
+         except Exception:
+             return None
+ 
++    def observe_kv_recovery_requeue(
++        self, req_id: str, reason: KVRecoveryRequeueReason
++    ) -> None:
++        """Report one exact post-wakeup defer without changing scheduling."""
++        observer = self._kv_recovery_observer
++        recovery_epoch = self._kv_recovery_receipt_ready.get(req_id)
++        req_status = self._req_status.get(req_id)
++        if (
++            observer is None
++            or recovery_epoch is None
++            or req_status is None
++            or recovery_epoch != req_status.req.num_preemptions
++        ):
++            return
++        with suppress(Exception):
++            observer.request_requeued(req_id, recovery_epoch, reason)
++
+     @staticmethod
+     def _append_kv_recovery_coordinate(
+         coordinates: list[KVRecoveryBlockCoordinate] | None,
+@@ -1237,10 +1256,20 @@ class OffloadingConnectorScheduler:
+ 
+         self._update_req_states(scheduler_output)
+ 
++        compute_contexts: dict[ReqId, KVRecoveryComputeContext] | None = (
++            {} if observer is not None else None
++        )
+         if observer is not None:
+             for req_id, recovery_epoch in admitted_recovery_epochs.items():
+                 with suppress(Exception):
+-                    observer.request_admitted(req_id, recovery_epoch)
++                    context = observer.request_admitted(req_id, recovery_epoch)
++                    if (
++                        isinstance(context, KVRecoveryComputeContext)
++                        and context.identity.runtime_request_id == req_id
++                        and context.identity.recovery_epoch == recovery_epoch
++                    ):
++                        assert compute_contexts is not None
++                        compute_contexts[req_id] = context
+ 
+         self.manager.update_device_pressure(
+             scheduler_output.kv_cache_usage,
+@@ -1281,6 +1310,7 @@ class OffloadingConnectorScheduler:
+             store_jobs=store_jobs,
+             jobs_to_flush=self._current_batch_jobs_to_flush,
+             kv_recovery_contexts=self._current_batch_kv_recovery_contexts,
++            kv_recovery_compute_contexts=compute_contexts,
+         )
+         self._current_batch_load_jobs = {}
+         self._current_batch_kv_recovery_contexts = (
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 5e8ed0db02..dd2a0f56a5 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -32,6 +32,8 @@ from vllm.v1.kv_offload.base import (
+ )
+ from vllm.v1.kv_recovery_profile import (
+     MAX_TRANSFER_IDS_PER_WAIT_SET,
++    KVRecoveryComputeContext,
++    KVRecoveryComputeKind,
+     KVRecoveryH2DReceipt,
+     KVRecoveryTransferAttempt,
+     KVRecoveryTransferContext,
+@@ -91,6 +93,9 @@ class OffloadingConnectorWorker:
+         self._kv_recovery_profiled_attempts: (
+             dict[int, KVRecoveryTransferAttempt] | None
+         ) = {} if kv_recovery_observer is not None else None
++        self._kv_recovery_compute_contexts: (
++            dict[ReqId, KVRecoveryComputeContext] | None
++        ) = {} if kv_recovery_observer is not None else None
+         self._connector_worker_meta = OffloadingWorkerMetadata()
+ 
+     def _begin_kv_recovery_transfer(
+@@ -533,6 +538,12 @@ class OffloadingConnectorWorker:
+         assert self.worker is not None
+         self._submit_pending_stores()
+ 
++        if self._kv_recovery_compute_contexts is not None:
++            self._fail_unobserved_first_compute()
++            self._kv_recovery_compute_contexts = dict(
++                metadata.kv_recovery_compute_contexts or {}
++            )
++
+         for job_id, entry in metadata.load_jobs.items():
+             self._load_jobs[job_id] = entry.req_id
+             context = None
+@@ -558,6 +569,42 @@ class OffloadingConnectorWorker:
+                     assert self._kv_recovery_profiled_attempts is not None
+                     self._kv_recovery_profiled_attempts[job_id] = attempt
+ 
++    def observe_kv_recovery_first_compute(
++        self,
++        runtime_request_id: str,
++        recovery_epoch: int,
++        timestamp_ns: int,
++        compute_kind: KVRecoveryComputeKind,
++        base_event_id: str,
++    ) -> None:
++        """Consume one exact admitted-roster sidecar at worker forward entry."""
++        observer = self._kv_recovery_observer
++        contexts = self._kv_recovery_compute_contexts
++        if observer is None or contexts is None:
++            return
++        context = contexts.get(runtime_request_id)
++        if context is None or context.identity.recovery_epoch != recovery_epoch:
++            return
++        contexts.pop(runtime_request_id, None)
++        with suppress(Exception):
++            observer.first_compute(
++                context,
++                timestamp_ns,
++                compute_kind,
++                base_event_id,
++            )
++
++    def _fail_unobserved_first_compute(self) -> None:
++        observer = self._kv_recovery_observer
++        contexts = self._kv_recovery_compute_contexts
++        if observer is None or not contexts:
++            return
++        pending = tuple(contexts.values())
++        contexts.clear()
++        for context in pending:
++            with suppress(Exception):
++                observer.first_compute_not_observed(context)
++
+     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
+         for job_id, entry in metadata.store_jobs.items():
+             # NOTE(orozery): defer the store to the beginning of the next
+@@ -646,6 +693,8 @@ class OffloadingConnectorWorker:
+             self._kv_recovery_store_contexts.clear()
+         if self._kv_recovery_profiled_attempts is not None:
+             self._kv_recovery_profiled_attempts.clear()
++        if self._kv_recovery_compute_contexts is not None:
++            self._fail_unobserved_first_compute()
+         self._connector_worker_meta = OffloadingWorkerMetadata()
+         try:
+             if self.worker is not None:
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+index 864df4db37..2b3fc6f41f 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -40,6 +40,8 @@ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
+ from vllm.v1.kv_recovery_profile import (
++    KVRecoveryComputeKind,
++    KVRecoveryRequeueReason,
+     create_kv_recovery_scheduler_observer,
+     create_kv_recovery_worker_observer,
+     kv_recovery_runtime_scope_authorized,
+@@ -103,6 +105,31 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+         assert self.connector_worker is not None
+         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
+ 
++    def observe_kv_recovery_requeue(
++        self, request: Request, reason: KVRecoveryRequeueReason
++    ) -> None:
++        if self.connector_scheduler is not None:
++            self.connector_scheduler.observe_kv_recovery_requeue(
++                request.request_id, reason
++            )
++
++    def observe_kv_recovery_first_compute(
++        self,
++        runtime_request_id: str,
++        recovery_epoch: int,
++        timestamp_ns: int,
++        compute_kind: KVRecoveryComputeKind,
++        base_event_id: str,
++    ) -> None:
++        if self.connector_worker is not None:
++            self.connector_worker.observe_kv_recovery_first_compute(
++                runtime_request_id,
++                recovery_epoch,
++                timestamp_ns,
++                compute_kind,
++                base_event_id,
++            )
++
+     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
+         assert self.connector_worker is not None
+         assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index eeadf05817..caf51ec55c 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -719,6 +719,10 @@ class Scheduler(SchedulerInterface):
+                     )
+                 ):
+                     # Scheduling would exceed max_loras, skip.
++                    if self.connector is not None:
++                        self.connector.observe_kv_recovery_requeue(
++                            request, "lora_capacity"
++                        )
+                     request_queue.pop_request()
+                     step_skipped_waiting.prepend_request(request)
+                     continue
+@@ -846,6 +850,10 @@ class Scheduler(SchedulerInterface):
+                 elif defer_prefills and num_computed_tokens < request.num_tokens - 1:
+                     # DP prefill balancing: defer this step's local prefill
+                     # compute to a cadence-aligned step.
++                    if self.connector is not None:
++                        self.connector.observe_kv_recovery_requeue(
++                            request, "prefill_throttled"
++                        )
+                     break
+                 else:
+                     # Number of tokens to be scheduled.
+@@ -867,6 +875,10 @@ class Scheduler(SchedulerInterface):
+                             or num_computed_tokens + num_new_tokens > self.max_model_len
+                         ):
+                             # Prefer to not schedule than schedule un-padded here.
++                            if self.connector is not None:
++                                self.connector.observe_kv_recovery_requeue(
++                                    request, "token_budget"
++                                )
+                             break
+                         pad_spec_decode = True
+ 
+@@ -882,6 +894,10 @@ class Scheduler(SchedulerInterface):
+                     ):
+                         # If chunked_prefill is disabled,
+                         # we can stop the scheduling here.
++                        if self.connector is not None:
++                            self.connector.observe_kv_recovery_requeue(
++                                request, "token_budget"
++                            )
+                         break
+ 
+                     num_new_tokens = min(num_new_tokens, token_budget)
+@@ -903,6 +919,10 @@ class Scheduler(SchedulerInterface):
+                         )
+                         if num_new_tokens == 0:
+                             # The request cannot be scheduled.
++                            if self.connector is not None:
++                                self.connector.observe_kv_recovery_requeue(
++                                    request, "encoder_budget"
++                                )
+                             break
+ 
+                 # Skip block alignment when setting up async receive (no local work).
+@@ -964,6 +984,11 @@ class Scheduler(SchedulerInterface):
+                 if new_blocks is None:
+                     # The request cannot be scheduled.
+ 
++                    if self.connector is not None:
++                        self.connector.observe_kv_recovery_requeue(
++                            request, "block_capacity"
++                        )
++
+                     # NOTE: we need to untouch the request from the encode cache
+                     # manager
+                     if request.has_encoder_inputs:
+diff --git a/vllm/v1/kv_recovery_profile.py b/vllm/v1/kv_recovery_profile.py
+index 442bee6b5a..e1b7752dff 100644
+--- a/vllm/v1/kv_recovery_profile.py
++++ b/vllm/v1/kv_recovery_profile.py
+@@ -14,6 +14,15 @@ from typing import Literal, Protocol
+ 
+ KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
+ KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]
++KVRecoveryRequeueReason = Literal[
++    "lora_capacity",
++    "prefill_throttled",
++    "token_budget",
++    "encoder_budget",
++    "block_capacity",
++    "unclassified",
++]
++KVRecoveryComputeKind = Literal["prefill", "decode"]
+ 
+ MAX_LOGICAL_BLOCKS_PER_SET = 4096
+ MAX_PREPARED_TRANSFER_ATTEMPTS_PER_PROCESS = 4096
+@@ -230,6 +239,7 @@ class KVRecoveryIdentity:
+     recovery_epoch: int | None
+     episode_id: str | None
+     base_preempted_event_id: str | None
++    preempt_profile_record_id: str | None
+ 
+     def __post_init__(self) -> None:
+         if not _is_lower_hex32(self.run_id):
+@@ -244,7 +254,11 @@ class KVRecoveryIdentity:
+             MAX_RUNTIME_REQUEST_ID_BYTES,
+         )
+         if self.recovery_epoch is None:
+-            if self.episode_id is not None or self.base_preempted_event_id is not None:
++            if (
++                self.episode_id is not None
++                or self.base_preempted_event_id is not None
++                or self.preempt_profile_record_id is not None
++            ):
+                 raise ValueError("non-recovery identity cannot carry episode fields")
+             return
+         if not _is_positive_uint64(self.recovery_epoch):
+@@ -258,6 +272,12 @@ class KVRecoveryIdentity:
+             raise ValueError(
+                 "base_preempted_event_id must use process_uuid:e:record_seq"
+             )
++        if self.preempt_profile_record_id is None or not _matches_scoped_uint64(
++            self.preempt_profile_record_id, _PROFILE_RECORD_ID_RE
++        ):
++            raise ValueError(
++                "preempt_profile_record_id must use process_uuid:k:record_seq"
++            )
+ 
+ 
+ def canonical_block_set_id(
+@@ -398,6 +418,36 @@ class KVRecoveryH2DReceipt:
+             raise ValueError("H2D receipt requires a recovery episode")
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class KVRecoveryComputeContext:
++    """Scheduler-to-worker sidecar for the first recovered compute."""
++
++    binding: KVRecoveryProfileBinding
++    identity: KVRecoveryIdentity
++    transfer_id: str
++    block_set_id: str
++    bytes_moved: int
++    admission_profile_record_id: str
++
++    def __post_init__(self) -> None:
++        if self.binding != KV_RECOVERY_PROFILE_BINDING:
++            raise ValueError("compute context is bound to an unknown candidate")
++        if self.identity.recovery_epoch is None:
++            raise ValueError("compute context requires a recovery episode")
++        if not _matches_transfer_id(self.transfer_id):
++            raise ValueError("compute context transfer_id is invalid")
++        if not _is_lower_hex64(self.block_set_id):
++            raise ValueError("compute context block_set_id must be lowercase SHA-256")
++        if not _is_positive_uint64(self.bytes_moved):
++            raise ValueError("compute context bytes_moved must be positive")
++        if not _matches_scoped_uint64(
++            self.admission_profile_record_id, _PROFILE_RECORD_ID_RE
++        ):
++            raise ValueError(
++                "admission_profile_record_id must use process_uuid:k:record_seq"
++            )
++
++
+ @dataclass(frozen=True, slots=True)
+ class KVRecoveryWaitMembership:
+     """Resolved process-scoped membership frozen before a worker wait."""
+@@ -438,7 +488,7 @@ class KVRecoverySchedulerObserver(Protocol):
+         self,
+         runtime_request_id: str,
+         recovery_epoch: int,
+-    ) -> None: ...
++    ) -> str | None: ...
+ 
+     def prepare_transfer_context(
+         self,
+@@ -459,12 +509,19 @@ class KVRecoverySchedulerObserver(Protocol):
+         recovery_epoch: int,
+     ) -> None: ...
+ 
+-    def request_admitted(
++    def request_requeued(
+         self,
+         runtime_request_id: str,
+         recovery_epoch: int,
++        reason: KVRecoveryRequeueReason,
+     ) -> None: ...
+ 
++    def request_admitted(
++        self,
++        runtime_request_id: str,
++        recovery_epoch: int,
++    ) -> KVRecoveryComputeContext | None: ...
++
+     def request_terminal(self, runtime_request_id: str) -> None: ...
+ 
+     def reset(self, stale_job_threshold: int) -> None: ...
+@@ -519,6 +576,19 @@ class KVRecoveryWorkerObserver(Protocol):
+         loss_reason: Literal["serialization_failure"],
+     ) -> None: ...
+ 
++    def first_compute(
++        self,
++        context: KVRecoveryComputeContext,
++        timestamp_ns: int,
++        compute_kind: KVRecoveryComputeKind,
++        base_event_id: str,
++    ) -> None: ...
++
++    def first_compute_not_observed(
++        self,
++        context: KVRecoveryComputeContext,
++    ) -> None: ...
++
+     def close(self) -> None: ...
+ 
+ 
+@@ -570,6 +640,14 @@ class KVRecoveryWorkerEvidenceSink(Protocol):
+         loss_reason: Literal["serialization_failure"],
+     ) -> None: ...
+ 
++    def first_compute(
++        self,
++        context: KVRecoveryComputeContext,
++        timestamp_ns: int,
++        compute_kind: KVRecoveryComputeKind,
++        base_event_id: str,
++    ) -> None: ...
++
+     def close(
+         self,
+         open_attempts: tuple[KVRecoveryTransferAttempt, ...],
+@@ -1050,6 +1128,66 @@ class BoundedKVRecoveryWorkerObserver:
+                 self._evidence_disabled = True
+             self._sink.h2d_receipt_capacity_exhausted(receipt, loss_reason)
+ 
++    def first_compute(
++        self,
++        context: KVRecoveryComputeContext,
++        timestamp_ns: int,
++        compute_kind: KVRecoveryComputeKind,
++        base_event_id: str,
++    ) -> None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed or self._evidence_disabled:
++                    return
++                valid = (
++                    isinstance(context, KVRecoveryComputeContext)
++                    and context.binding == KV_RECOVERY_PROFILE_BINDING
++                    and context.identity.run_id == self._run_id
++                    and _is_uint64(timestamp_ns)
++                    and compute_kind in {"prefill", "decode"}
++                    and _matches_scoped_uint64(base_event_id, _BASE_EVENT_ID_RE)
++                )
++                if not valid:
++                    self._evidence_disabled = True
++            if valid:
++                self._sink.first_compute(
++                    context,
++                    timestamp_ns,
++                    compute_kind,
++                    base_event_id,
++                )
++            else:
++                self._sink.evidence_failure(
++                    reason="invalid_first_compute_observation",
++                    connector_job_ids=(),
++                    transfer_ids=(
++                        (context.transfer_id,)
++                        if isinstance(context, KVRecoveryComputeContext)
++                        else ()
++                    ),
++                    timestamp_ns=timestamp_ns if _is_uint64(timestamp_ns) else None,
++                )
++
++    def first_compute_not_observed(
++        self,
++        context: KVRecoveryComputeContext,
++    ) -> None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed:
++                    return
++                self._evidence_disabled = True
++            self._sink.evidence_failure(
++                reason="missing_first_compute_observation",
++                connector_job_ids=(),
++                transfer_ids=(
++                    (context.transfer_id,)
++                    if isinstance(context, KVRecoveryComputeContext)
++                    else ()
++                ),
++                timestamp_ns=None,
++            )
++
+     def close(self) -> None:
+         with self._lifecycle_lock:
+             with self._state_lock:
+-- 
+2.53.0.windows.3
+

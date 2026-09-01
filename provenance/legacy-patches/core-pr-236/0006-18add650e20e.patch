@@ -1,0 +1,880 @@
+From 18add650e20e6b617703add78258fbd7a2f74501 Mon Sep 17 00:00:00 2001
+From: Remby Lis <153624059+Remygred@users.noreply.github.com>
+Date: Wed, 5 Aug 2026 03:19:35 +0000
+Subject: [PATCH] fix(kv): preserve wait evidence across flushes
+
+Separate completion fences from explicit recovery-context discard handoffs, add real bounded-observer regressions, and keep the disabled path free of profiling clock work.\n\nAssisted-by: OpenAI Codex
+---
+ .../test_kv_recovery_scheduler.py             |  84 +++++++-
+ .../test_kv_recovery_worker.py                | 195 +++++++++++++++++-
+ .../test_kv_recovery_forward_observer.py      |  19 +-
+ tools/pre_commit/check_forbidden_imports.py   |   5 +
+ .../kv_transfer/kv_connector/v1/base.py       |  10 +-
+ .../kv_connector/v1/offloading/common.py      |   4 +
+ .../kv_connector/v1/offloading/scheduler.py   |  32 ++-
+ .../kv_connector/v1/offloading/worker.py      |  32 ++-
+ .../kv_connector/v1/offloading_connector.py   |   4 +-
+ vllm/v1/kv_recovery_profile.py                |  46 +++--
+ vllm/v1/worker/gpu/kv_connector.py            |   4 +-
+ .../worker/kv_connector_model_runner_mixin.py |   4 +-
+ 12 files changed, 373 insertions(+), 66 deletions(-)
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+index 25b3da791f4..5cd251d24a7 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+@@ -33,6 +33,7 @@ from vllm.v1.kv_recovery_profile import (
+     canonical_block_set_id,
+ )
+ from vllm.v1.outputs import KVConnectorOutput
++from vllm.v1.request import RequestStatus
+ 
+ pytestmark = pytest.mark.cpu_test
+ 
+@@ -164,6 +165,8 @@ class RecordingWorkerObserver:
+         self.contexts: list[KVRecoveryTransferContext] = []
+         self.transfer_seq = 0
+         self.waits: list[KVRecoveryWaitAttempt] = []
++        self.invalidations: list[frozenset[int]] = []
++        self.wait_invalidation_events: list[tuple[str, object]] = []
+         self.first_compute_observations: list[tuple[KVRecoveryComputeContext, int]] = []
+         self.missing_first_compute: list[KVRecoveryComputeContext] = []
+ 
+@@ -218,6 +221,8 @@ class RecordingWorkerObserver:
+         )
+ 
+     def prepare_wait(self, connector_job_ids):
++        membership = frozenset(connector_job_ids)
++        self.wait_invalidation_events.append(("prepare_wait", membership))
+         transfer_ids = tuple(
+             sorted(self.attempts[job_id].transfer_id for job_id in connector_job_ids)
+         )
+@@ -225,6 +230,14 @@ class RecordingWorkerObserver:
+ 
+     def wait_completed(self, attempt):
+         self.waits.append(attempt)
++        self.wait_invalidation_events.append(("wait_completed", attempt.transfer_ids))
++
++    def invalidate_transfers(self, connector_job_ids):
++        membership = frozenset(connector_job_ids)
++        self.invalidations.append(membership)
++        self.wait_invalidation_events.append(("invalidate", membership))
++        for job_id in membership:
++            self.attempts.pop(job_id, None)
+ 
+     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         raise AssertionError("receipt capacity unexpectedly exhausted")
+@@ -388,6 +401,16 @@ def test_pressure_preemption_preserves_identity_through_real_connector_path(
+     assert factory.scheduler.preemptions == [(runtime_request_id, 1)]
+     assert factory.scheduler.admission_starts == [(runtime_request_id, 1)]
+     assert factory.scheduler.admissions == [(runtime_request_id, 1, "decode")]
++    flushed_transfer_job_ids = frozenset({0, 1})
++    assert factory.worker.invalidations == [flushed_transfer_job_ids]
++    assert factory.worker.wait_invalidation_events == [
++        ("prepare_wait", flushed_transfer_job_ids),
++        (
++            "wait_completed",
++            tuple(f"{'a' * 32}:t:{transfer_seq}" for transfer_seq in range(2)),
++        ),
++        ("invalidate", flushed_transfer_job_ids),
++    ]
+     connector_worker = runner.worker_connector.connector_worker
+     assert connector_worker is not None
+     compute_contexts = connector_worker._kv_recovery_compute_contexts
+@@ -496,7 +519,7 @@ def test_recovery_coordinate_capture_is_bounded_by_one_overflow_sentinel(
+             observed_lengths.append(len(coordinates))
+             return None
+ 
+-    coordinates = []
++    coordinates: list[recovery_profile.KVRecoveryBlockCoordinate] = []
+     for ordinal in range(recovery_profile.MAX_LOGICAL_BLOCKS_PER_SET + 100):
+         scheduler_module.OffloadingConnectorScheduler._append_kv_recovery_coordinate(
+             coordinates,
+@@ -542,6 +565,65 @@ def test_disabled_scheduler_never_constructs_recovery_coordinates(
+ 
+     runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+ 
++    assert (
++        runner.connector_scheduler._current_batch_kv_recovery_jobs_to_invalidate is None
++    )
++
++
++def test_terminal_handoff_invalidates_only_existing_profiled_jobs(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    factory = RecordingFactory()
++    enable_test_observer_factory(monkeypatch, factory)
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++    )
++    runner.new_request(token_ids=[0] * 4)
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    runner.run(decoded_tokens=[0], complete_transfers=False)
++
++    scheduler = runner.connector_scheduler
++    req_status = scheduler._req_status["0"]
++    existing_job_ids = set(req_status.transfer_jobs)
++    assert existing_job_ids
++
++    req_status.req.status = RequestStatus.FINISHED_STOPPED
++    scheduler.request_finished(req_status.req)
++
++    assert scheduler._current_batch_kv_recovery_jobs_to_invalidate == (existing_job_ids)
++
++
++def test_reset_handoff_waits_for_and_invalidates_exact_inflight_jobs(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    factory = RecordingFactory()
++    enable_test_observer_factory(monkeypatch, factory)
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++    )
++    runner.new_request(token_ids=[0] * 4)
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    runner.run(decoded_tokens=[0], complete_transfers=False)
++
++    scheduler = runner.connector_scheduler
++    existing_job_ids = set(scheduler._jobs)
++    assert existing_job_ids
++
++    scheduler.reset_cache()
++
++    assert scheduler._current_batch_jobs_to_flush == existing_job_ids
++    assert scheduler._current_batch_kv_recovery_jobs_to_invalidate == (existing_job_ids)
++
+ 
+ def test_reset_notifies_observer_and_filters_stale_or_unmatched_receipts(
+     request_runner,
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+index 948d5347e41..50e6ee0ee0c 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+@@ -87,6 +87,7 @@ class RecordingObserver:
+         self.attempts: dict[int, KVRecoveryTransferAttempt] = {}
+         self.transfer_seq = 0
+         self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
++        self.invalidation_calls: list[frozenset[int]] = []
+         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
+         self.first_compute_observations: list[tuple[object, int]] = []
+         self.missing_first_compute: list[object] = []
+@@ -168,6 +169,16 @@ class RecordingObserver:
+         )
+         return KVRecoveryWaitMembership(transfer_ids)
+ 
++    def invalidate_transfers(self, connector_job_ids):
++        self._raise_if_requested("invalidate_transfers")
++        membership = frozenset(connector_job_ids)
++        if self.attempts.keys().isdisjoint(membership):
++            return
++        self.events.append(("observer_invalidate", membership))
++        self.invalidation_calls.append(membership)
++        for job_id in membership:
++            self.attempts.pop(job_id, None)
++
+     def wait_completed(self, attempt):
+         self._raise_if_requested("wait_completed")
+         self.events.append(("observer_wait_completed", attempt.transfer_ids))
+@@ -197,9 +208,10 @@ class RecordingEvidenceSink:
+         ] = []
+         self.failures: list[tuple[str, tuple[int, ...]]] = []
+         self.waits: list[KVRecoveryWaitAttempt] = []
++        self.wait_invalidation_events: list[tuple[str, object]] = []
+         self.receipt_capacity_losses: list[tuple[KVRecoveryH2DReceipt, str]] = []
+         self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
+-        self.first_compute_observations: list[tuple[object, int, str, str]] = []
++        self.first_compute_observations: list[tuple[object, int]] = []
+ 
+     def transfer_submitted(self, attempt, timestamp_ns):
+         self.submissions.append((attempt, timestamp_ns))
+@@ -257,9 +269,11 @@ class RecordingEvidenceSink:
+         timestamp_ns,
+     ):
+         self.failures.append((reason, connector_job_ids))
++        self.wait_invalidation_events.append(("failure", reason))
+ 
+     def wait_completed(self, attempt):
+         self.waits.append(attempt)
++        self.wait_invalidation_events.append(("wait", attempt.transfer_ids))
+ 
+     def h2d_receipt_capacity_exhausted(self, receipt, loss_reason):
+         self.receipt_capacity_losses.append((receipt, loss_reason))
+@@ -345,6 +359,7 @@ def metadata(
+     jobs_to_flush: set[int] | None = None,
+     kv_recovery_contexts: Iterable[tuple[int, KVRecoveryTransferContext]] = (),
+     kv_recovery_compute_contexts: Iterable[tuple[str, KVRecoveryComputeContext]] = (),
++    kv_recovery_jobs_to_invalidate: set[int] | None = None,
+ ) -> OffloadingConnectorMetadata:
+     contexts = dict(kv_recovery_contexts)
+     compute_contexts = dict(kv_recovery_compute_contexts)
+@@ -354,6 +369,7 @@ def metadata(
+         jobs_to_flush=jobs_to_flush,
+         kv_recovery_contexts=contexts or None,
+         kv_recovery_compute_contexts=compute_contexts or None,
++        kv_recovery_jobs_to_invalidate=kv_recovery_jobs_to_invalidate,
+     )
+ 
+ 
+@@ -385,11 +401,13 @@ def test_connector_metadata_sidecar_round_trips_and_defaults_off():
+ 
+     assert disabled_copy.kv_recovery_contexts is None
+     assert disabled_copy.kv_recovery_compute_contexts is None
++    assert disabled_copy.kv_recovery_jobs_to_invalidate is None
+     assert active_copy.kv_recovery_contexts == {7: context}
+     assert active_copy.kv_recovery_compute_contexts == {"request-0": compute_context}
++    assert active_copy.kv_recovery_jobs_to_invalidate is None
+ 
+ 
+-def test_worker_first_compute_consumes_exact_admitted_roster_once():
++def test_worker_first_compute_consumes_exact_admitted_roster_once(monkeypatch):
+     events: list[tuple] = []
+     observer = RecordingObserver(events)
+     worker, _backend, _events = make_worker(observer)
+@@ -400,13 +418,15 @@ def test_worker_first_compute_consumes_exact_admitted_roster_once():
+         )
+     )
+ 
+-    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}), 200)
+-    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}), 201)
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", lambda: 200)
++
++    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}))
++    worker.observe_kv_recovery_first_compute(frozenset({"request-0"}))
+ 
+     assert observer.first_compute_observations == [(context, 200)]
+ 
+ 
+-def test_worker_first_compute_fails_closed_for_roster_mismatch():
++def test_worker_first_compute_fails_closed_for_roster_mismatch(monkeypatch):
+     events: list[tuple] = []
+     observer = RecordingObserver(events)
+     worker, _backend, _events = make_worker(observer)
+@@ -415,7 +435,40 @@ def test_worker_first_compute_fails_closed_for_roster_mismatch():
+         metadata(kv_recovery_compute_contexts=(("request-0", context),))
+     )
+ 
+-    worker.observe_kv_recovery_first_compute(frozenset({"request-1"}), 200)
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", lambda: 200)
++
++    worker.observe_kv_recovery_first_compute(frozenset({"request-1"}))
++
++    assert observer.first_compute_observations == []
++    assert observer.missing_first_compute == [context]
++
++
++def test_disabled_worker_first_compute_does_not_read_clock(monkeypatch):
++    worker, _backend, _events = make_worker()
++
++    def unexpected_clock_read():
++        raise AssertionError("disabled KV-recovery path read the clock")
++
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", unexpected_clock_read)
++
++    worker.observe_kv_recovery_first_compute({"request-0"})
++
++
++def test_first_compute_clock_failure_is_fail_open_and_marks_missing(monkeypatch):
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, _backend, _events = make_worker(observer)
++    context = make_compute_context()
++    worker.start_kv_transfers(
++        metadata(kv_recovery_compute_contexts=(("request-0", context),))
++    )
++
++    def unavailable_clock():
++        raise RuntimeError("clock unavailable")
++
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", unavailable_clock)
++
++    worker.observe_kv_recovery_first_compute({"request-0"})
+ 
+     assert observer.first_compute_observations == []
+     assert observer.missing_first_compute == [context]
+@@ -778,7 +831,12 @@ def test_successful_wait_preparation_is_not_recorded_when_backend_raises():
+     backend.wait_error = RuntimeError("backend wait failed")
+ 
+     with pytest.raises(RuntimeError, match="backend wait failed"):
+-        worker.handle_preemptions(metadata(jobs_to_flush={3}))
++        worker.handle_preemptions(
++            metadata(
++                jobs_to_flush={3},
++                kv_recovery_jobs_to_invalidate={3},
++            )
++        )
+ 
+     assert events[-2:] == [
+         ("observer_prepare_wait", frozenset({3})),
+@@ -821,6 +879,129 @@ def test_successful_wait_is_recorded_only_after_backend_returns():
+     ]
+     assert len(observer.wait_completed_calls) == 1
+     assert observer.wait_completed_calls[0].transfer_ids == (f"{'a' * 32}:t:0",)
++    assert observer.invalidation_calls == []
++
++
++@pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
++def test_bounded_observer_flush_records_wait_and_completion(operation):
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        "a" * 32,
++        "0" * 32,
++        "c" * 32,
++        sink,
++    )
++    worker, backend, events = make_worker(observer)
++    backend.events = events
++    context = make_context(operation)
++    if operation == "h2d_restore":
++        worker.start_kv_transfers(
++            metadata(
++                load_jobs=((3, make_load_job()),),
++                kv_recovery_contexts=((3, context),),
++            )
++        )
++    else:
++        worker.prepare_store_kv(
++            metadata(
++                store_jobs=((3, make_store_job()),),
++                kv_recovery_contexts=((3, context),),
++            )
++        )
++
++    worker.handle_preemptions(metadata(jobs_to_flush={3}))
++
++    assert [event[0] for event in events] == [
++        "backend_submit_load" if operation == "h2d_restore" else "backend_submit_store",
++        "backend_wait",
++    ]
++    assert len(sink.waits) == 1
++    assert sink.waits[0].transfer_ids == (f"{'a' * 32}:t:0",)
++    assert sink.failures == []
++    assert sink.wait_invalidation_events == [
++        ("wait", (f"{'a' * 32}:t:0",)),
++    ]
++    assert not observer.evidence_disabled
++
++    backend.finished.append(TransferResult(3, True, 128, 0.25))
++    assert worker.get_finished(set()) == (
++        set(),
++        {"request-0"} if operation == "h2d_restore" else set(),
++    )
++
++    assert sink.completions == [3]
++    assert observer.pending_h2d_count == 0
++    assert observer.pending_d2h_count == 0
++    assert not observer.evidence_disabled
++
++
++def test_bounded_observer_wait_precedes_explicit_discard_invalidation():
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        "a" * 32,
++        "0" * 32,
++        "c" * 32,
++        sink,
++    )
++    worker, backend, events = make_worker(observer)
++    backend.events = events
++    worker.prepare_store_kv(
++        metadata(
++            store_jobs=((3, make_store_job()),),
++            kv_recovery_contexts=((3, make_context("d2h_preserve")),),
++        )
++    )
++
++    worker.handle_preemptions(
++        metadata(
++            jobs_to_flush={3},
++            kv_recovery_jobs_to_invalidate={3},
++        )
++    )
++
++    assert sink.wait_invalidation_events == [
++        ("wait", (f"{'a' * 32}:t:0",)),
++        ("failure", "connector_flush_invalidation"),
++    ]
++    assert sink.completions == []
++    assert observer.pending_d2h_count == 0
++    assert observer.evidence_disabled
++
++
++def test_bounded_observer_wait_failure_keeps_transfer_pending():
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        "a" * 32,
++        "0" * 32,
++        "c" * 32,
++        sink,
++    )
++    worker, backend, _events = make_worker(observer)
++    context = make_context("d2h_preserve")
++    job = make_store_job()
++    worker.prepare_store_kv(
++        metadata(
++            store_jobs=((3, job),),
++            kv_recovery_contexts=((3, context),),
++        )
++    )
++    backend.wait_error = RuntimeError("backend wait failed")
++
++    with pytest.raises(RuntimeError, match="backend wait failed"):
++        worker.handle_preemptions(metadata(jobs_to_flush={3}))
++
++    assert sink.waits == []
++    assert sink.failures == []
++    assert sink.wait_invalidation_events == []
++    assert observer.pending_d2h_count == 1
++    assert not observer.evidence_disabled
++
++    backend.finished.append(TransferResult(3, True, 128, 0.25))
++    assert worker.get_finished(set()) == (set(), set())
++
++    assert sink.completions == [3]
++    assert observer.pending_d2h_count == 0
++    assert not observer.evidence_disabled
+ 
+ 
+ def test_prepared_transfer_capacity_is_distinct_and_fail_open(
+diff --git a/tests/v1/worker/test_kv_recovery_forward_observer.py b/tests/v1/worker/test_kv_recovery_forward_observer.py
+index 6beca76ed1b..73d2f8dd95b 100644
+--- a/tests/v1/worker/test_kv_recovery_forward_observer.py
++++ b/tests/v1/worker/test_kv_recovery_forward_observer.py
+@@ -9,14 +9,13 @@ from vllm.v1.worker.gpu import kv_connector as v2_connector_module
+ 
+ class RecordingConnector:
+     def __init__(self) -> None:
+-        self.observations: list[tuple[frozenset[str], int]] = []
++        self.observations: list[frozenset[str]] = []
+ 
+     def observe_kv_recovery_first_compute(
+         self,
+-        scheduled_request_ids: frozenset[str],
+-        timestamp_ns: int,
++        scheduled_request_ids,
+     ) -> None:
+-        self.observations.append((scheduled_request_ids, timestamp_ns))
++        self.observations.append(frozenset(scheduled_request_ids))
+ 
+ 
+ def test_mrv1_forward_observer_passes_exact_scheduler_roster(monkeypatch):
+@@ -30,15 +29,11 @@ def test_mrv1_forward_observer_passes_exact_scheduler_roster(monkeypatch):
+         "get_kv_transfer_group",
+         lambda: connector,
+     )
+-    monkeypatch.setattr(mixin_module.time, "monotonic_ns", lambda: 123)
+-
+     mixin_module.KVConnectorModelRunnerMixin.observe_kv_recovery_first_compute(
+         scheduler_output
+     )
+ 
+-    assert connector.observations == [
+-        (frozenset({"request-0", "request-1"}), 123)
+-    ]
++    assert connector.observations == [frozenset({"request-0", "request-1"})]
+ 
+ 
+ def test_mrv1_forward_observer_is_noop_without_connector(monkeypatch):
+@@ -58,11 +53,9 @@ def test_mrv2_forward_observer_passes_exact_scheduler_roster(monkeypatch):
+     active._disabled = False
+     active.kv_connector = connector
+     scheduler_output = SimpleNamespace(num_scheduled_tokens={"request-0": 1})
+-    monkeypatch.setattr(v2_connector_module.time, "monotonic_ns", lambda: 456)
+-
+     active.observe_kv_recovery_first_compute(scheduler_output)
+ 
+-    assert connector.observations == [(frozenset({"request-0"}), 456)]
++    assert connector.observations == [frozenset({"request-0"})]
+ 
+ 
+ def test_mrv2_forward_observer_is_noop_when_disabled(monkeypatch):
+@@ -72,8 +65,6 @@ def test_mrv2_forward_observer_is_noop_when_disabled(monkeypatch):
+     )
+     active._disabled = True
+     active.kv_connector = connector
+-    monkeypatch.setattr(v2_connector_module.time, "monotonic_ns", lambda: 456)
+-
+     active.observe_kv_recovery_first_compute(
+         SimpleNamespace(num_scheduled_tokens={"request-0": 1})
+     )
+diff --git a/tools/pre_commit/check_forbidden_imports.py b/tools/pre_commit/check_forbidden_imports.py
+index 365b2f5bb77..b24673bb1fa 100644
+--- a/tools/pre_commit/check_forbidden_imports.py
++++ b/tools/pre_commit/check_forbidden_imports.py
+@@ -45,6 +45,11 @@ CHECK_IMPORTS = {
+             "tests/tokenizers_/test_hf.py",
+             "tests/utils_/test_hashing.py",
+             "tests/compile/test_aot_compile.py",
++            # Exercises the connector metadata's real multiprocessing wire shape.
++            (
++                "tests/v1/kv_connector/unit/offloading_connector/"
++                "test_kv_recovery_worker.py"
++            ),
+             "benchmarks/kernels/graph_machete_bench.py",
+             "benchmarks/kernels/benchmark_lora.py",
+             "benchmarks/kernels/benchmark_machete.py",
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/base.py b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+index e71dbb9fa7b..19774a4dbd8 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/base.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/base.py
+@@ -65,6 +65,7 @@ if TYPE_CHECKING:
+     from vllm.v1.core.block_pool import BlockPool
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+     from vllm.v1.kv_cache_interface import KVCacheConfig
++    from vllm.v1.kv_recovery_profile import KVRecoveryRequeueReason
+     from vllm.v1.request import Request
+ 
+ # s_tensor_list, d_tensor_list, s_indices, d_indices, direction
+@@ -529,14 +530,17 @@ class KVConnectorBase_V1(ABC):
+         """
+         return
+ 
+-    def observe_kv_recovery_requeue(self, request: "Request", reason: str) -> None:
++    def observe_kv_recovery_requeue(
++        self,
++        request: "Request",
++        reason: "KVRecoveryRequeueReason",
++    ) -> None:
+         """Optional default-off observation of a post-wakeup scheduler defer."""
+         return
+ 
+     def observe_kv_recovery_first_compute(
+         self,
+-        scheduled_request_ids: frozenset[str],
+-        timestamp_ns: int,
++        scheduled_request_ids: Iterable[str],
+     ) -> None:
+         """Optional default-off observation at the worker model-forward entry."""
+         return
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+index 904ad3a16d3..8e3aeed83ef 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+@@ -78,6 +78,10 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
+     jobs_to_flush: set[int] | None = None
+     kv_recovery_contexts: dict[int, KVRecoveryTransferContext] | None = None
+     kv_recovery_compute_contexts: dict[str, KVRecoveryComputeContext] | None = None
++    # Formal-observer contexts whose runtime ownership was actually abandoned.
++    # This is deliberately distinct from jobs_to_flush: a flush normally waits
++    # for a real transfer to complete and must retain its completion evidence.
++    kv_recovery_jobs_to_invalidate: set[int] | None = None
+ 
+ 
+ @dataclass
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index e604c768ca4..3c919c4f58e 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -385,6 +385,9 @@ class OffloadingConnectorScheduler:
+         self._current_batch_kv_recovery_contexts: (
+             dict[int, KVRecoveryTransferContext] | None
+         ) = {} if kv_recovery_observer is not None else None
++        self._current_batch_kv_recovery_jobs_to_invalidate: set[int] | None = (
++            set() if kv_recovery_observer is not None else None
++        )
+         self._kv_recovery_receipt_ready: dict[ReqId, int] = {}
+         self._current_batch_jobs_to_flush: set[int] = set()
+         # GPU block IDs allocated in the current engine step
+@@ -1221,6 +1224,12 @@ class OffloadingConnectorScheduler:
+                 self._kv_recovery_receipt_ready.pop(req_id, None)
+                 req_status = self._req_status.get(req_id)
+                 if req_status is not None:
++                    assert (
++                        self._current_batch_kv_recovery_jobs_to_invalidate is not None
++                    )
++                    self._current_batch_kv_recovery_jobs_to_invalidate.update(
++                        req_status.transfer_jobs
++                    )
+                     with suppress(Exception):
+                         observer.request_preempted(
+                             req_id,
+@@ -1323,11 +1332,17 @@ class OffloadingConnectorScheduler:
+             jobs_to_flush=self._current_batch_jobs_to_flush,
+             kv_recovery_contexts=self._current_batch_kv_recovery_contexts,
+             kv_recovery_compute_contexts=compute_contexts,
++            kv_recovery_jobs_to_invalidate=(
++                self._current_batch_kv_recovery_jobs_to_invalidate
++            ),
+         )
+         self._current_batch_load_jobs = {}
+         self._current_batch_kv_recovery_contexts = (
+             {} if self._kv_recovery_observer is not None else None
+         )
++        self._current_batch_kv_recovery_jobs_to_invalidate = (
++            set() if self._kv_recovery_observer is not None else None
++        )
+         self._current_batch_jobs_to_flush = set()
+         self._current_batch_allocated_block_ids = set()
+         return meta
+@@ -1469,9 +1484,11 @@ class OffloadingConnectorScheduler:
+                         receipts_incomplete,
+                     )
+                     for receipt in fresh_receipts:
+-                        self._kv_recovery_receipt_ready[
+-                            receipt.identity.runtime_request_id
+-                        ] = receipt.identity.recovery_epoch
++                        recovery_epoch = receipt.identity.recovery_epoch
++                        if recovery_epoch is not None:
++                            self._kv_recovery_receipt_ready[
++                                receipt.identity.runtime_request_id
++                            ] = recovery_epoch
+             except Exception:
+                 pass
+ 
+@@ -1527,6 +1544,12 @@ class OffloadingConnectorScheduler:
+ 
+         self.manager.on_request_finished(req_status.req_context)
+ 
++        if observer is not None:
++            assert self._current_batch_kv_recovery_jobs_to_invalidate is not None
++            self._current_batch_kv_recovery_jobs_to_invalidate.update(
++                req_status.transfer_jobs
++            )
++
+         if not req_status.transfer_jobs:
+             # No in-flight jobs: no later complete_store()/complete_load() calls
+             # need this request's state.
+@@ -1562,11 +1585,14 @@ class OffloadingConnectorScheduler:
+         # reset_cache cannot be called in the middle of a schedule step
+         assert not self._current_batch_load_jobs
+         assert not self._current_batch_kv_recovery_contexts
++        assert not self._current_batch_kv_recovery_jobs_to_invalidate
+         assert not self._current_batch_jobs_to_flush
+         assert not self._current_batch_allocated_block_ids
+ 
+         # Flush all in-flight jobs
+         self._current_batch_jobs_to_flush.update(self._jobs.keys())
++        if self._current_batch_kv_recovery_jobs_to_invalidate is not None:
++            self._current_batch_kv_recovery_jobs_to_invalidate.update(self._jobs.keys())
+ 
+         for req_id, status in list(self._req_status.items()):
+             if status.req.is_finished():
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 80da9371f1e..b1dc8695f64 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -3,6 +3,7 @@
+ import math
+ import time
+ from collections import defaultdict
++from collections.abc import Iterable
+ from contextlib import suppress
+ from dataclasses import replace
+ from itertools import islice
+@@ -514,12 +515,6 @@ class OffloadingConnectorWorker:
+         self._submit_pending_stores()
+ 
+         if kv_connector_metadata.jobs_to_flush:
+-            observer = self._kv_recovery_observer
+-            if observer is not None:
+-                with suppress(Exception):
+-                    observer.invalidate_transfers(
+-                        frozenset(kv_connector_metadata.jobs_to_flush)
+-                    )
+             wait_membership = self._prepare_kv_recovery_wait(
+                 kv_connector_metadata.jobs_to_flush
+             )
+@@ -533,6 +528,17 @@ class OffloadingConnectorWorker:
+                     entry_timestamp_ns,
+                 )
+ 
++        # A flush is normally a completion fence, not an abandonment. Only
++        # consume contexts named by the scheduler's explicit discard handoff,
++        # and do so after any required backend wait has completed.
++        if kv_connector_metadata.kv_recovery_jobs_to_invalidate:
++            observer = self._kv_recovery_observer
++            if observer is not None:
++                with suppress(Exception):
++                    observer.invalidate_transfers(
++                        kv_connector_metadata.kv_recovery_jobs_to_invalidate
++                    )
++
+     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+         assert self.worker is not None
+         self._submit_pending_stores()
+@@ -570,13 +576,21 @@ class OffloadingConnectorWorker:
+ 
+     def observe_kv_recovery_first_compute(
+         self,
+-        scheduled_request_ids: frozenset[str],
+-        timestamp_ns: int,
++        scheduled_request_ids: Iterable[str],
+     ) -> None:
+         """Consume the exact admitted sidecars at the worker forward entry."""
+         observer = self._kv_recovery_observer
+         contexts = self._kv_recovery_compute_contexts
+-        if observer is None or contexts is None:
++        if observer is None or not contexts:
++            return
++        try:
++            scheduled_request_ids = frozenset(scheduled_request_ids)
++        except Exception:
++            self._fail_unobserved_first_compute()
++            return
++        timestamp_ns = self._profile_clock_ns()
++        if timestamp_ns is None:
++            self._fail_unobserved_first_compute()
+             return
+         pending = tuple(contexts.items())
+         contexts.clear()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+index 7be31a8654f..ecae3a0e407 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -114,13 +114,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+ 
+     def observe_kv_recovery_first_compute(
+         self,
+-        scheduled_request_ids: frozenset[str],
+-        timestamp_ns: int,
++        scheduled_request_ids: Iterable[str],
+     ) -> None:
+         if self.connector_worker is not None:
+             self.connector_worker.observe_kv_recovery_first_compute(
+                 scheduled_request_ids,
+-                timestamp_ns,
+             )
+ 
+     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
+diff --git a/vllm/v1/kv_recovery_profile.py b/vllm/v1/kv_recovery_profile.py
+index 72f370f1438..56b7053ad74 100644
+--- a/vllm/v1/kv_recovery_profile.py
++++ b/vllm/v1/kv_recovery_profile.py
+@@ -7,11 +7,13 @@ from __future__ import annotations
+ 
+ import hashlib
+ import os
+-import re
++from collections.abc import Set
+ from dataclasses import dataclass
+ from threading import Lock
+ from typing import Literal, Protocol
+ 
++import regex as re
++
+ KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
+ KVRecoveryCapacity = Literal["prepared_transfer", "pending_h2d", "pending_d2h"]
+ KVRecoveryRequeueReason = Literal[
+@@ -576,7 +578,7 @@ class KVRecoveryWorkerObserver(Protocol):
+ 
+     def invalidate_transfers(
+         self,
+-        connector_job_ids: frozenset[int],
++        connector_job_ids: Set[int],
+     ) -> None: ...
+ 
+     def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
+@@ -1077,8 +1079,8 @@ class BoundedKVRecoveryWorkerObserver:
+                 )
+             )
+ 
+-    def invalidate_transfers(self, connector_job_ids: frozenset[int]) -> None:
+-        """Consume formal contexts named by an EngineCore flush handoff."""
++    def invalidate_transfers(self, connector_job_ids: Set[int]) -> None:
++        """Consume bounded contexts named by an explicit discard handoff."""
+         if not connector_job_ids:
+             return
+         with self._lifecycle_lock:
+@@ -1086,27 +1088,31 @@ class BoundedKVRecoveryWorkerObserver:
+                 if self._closed:
+                     return
+                 invalidated: list[KVRecoveryTransferAttempt] = []
+-                for connector_job_id in sorted(connector_job_ids):
+-                    prepared = self._prepared_by_job_id.pop(connector_job_id, None)
+-                    if prepared is not None:
+-                        invalidated.append(prepared)
+-                    transfer_id = self._h2d_transfer_id_by_connector_job_id.pop(
+-                        connector_job_id, None
+-                    )
+-                    if transfer_id is not None:
+-                        pending_h2d = self._pending_h2d_by_transfer_id.pop(
+-                            transfer_id, None
++                for connector_job_id in tuple(self._prepared_by_job_id):
++                    if connector_job_id in connector_job_ids:
++                        invalidated.append(
++                            self._prepared_by_job_id.pop(connector_job_id)
+                         )
+-                        if pending_h2d is not None:
+-                            invalidated.append(pending_h2d.attempt)
+-                    pending_d2h = self._pending_d2h_by_job_id.pop(
+-                        connector_job_id, None
++                for connector_job_id, transfer_id in tuple(
++                    self._h2d_transfer_id_by_connector_job_id.items()
++                ):
++                    if connector_job_id not in connector_job_ids:
++                        continue
++                    del self._h2d_transfer_id_by_connector_job_id[connector_job_id]
++                    pending_h2d = self._pending_h2d_by_transfer_id.pop(
++                        transfer_id, None
+                     )
+-                    if pending_d2h is not None:
+-                        invalidated.append(pending_d2h.attempt)
++                    if pending_h2d is not None:
++                        invalidated.append(pending_h2d.attempt)
++                for connector_job_id in tuple(self._pending_d2h_by_job_id):
++                    if connector_job_id in connector_job_ids:
++                        invalidated.append(
++                            self._pending_d2h_by_job_id.pop(connector_job_id).attempt
++                        )
+                 if invalidated:
+                     self._evidence_disabled = True
+             if invalidated:
++                invalidated.sort(key=lambda attempt: attempt.connector_job_id)
+                 self._sink.evidence_failure(
+                     reason="connector_flush_invalidation",
+                     connector_job_ids=tuple(
+diff --git a/vllm/v1/worker/gpu/kv_connector.py b/vllm/v1/worker/gpu/kv_connector.py
+index 68e37af5577..0e842b73f7a 100644
+--- a/vllm/v1/worker/gpu/kv_connector.py
++++ b/vllm/v1/worker/gpu/kv_connector.py
+@@ -1,6 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-import time
+ from typing import TYPE_CHECKING
+ 
+ import torch
+@@ -86,8 +85,7 @@ class ActiveKVConnector(KVConnector):
+         if self._disabled:
+             return
+         self.kv_connector.observe_kv_recovery_first_compute(
+-            frozenset(scheduler_output.num_scheduled_tokens),
+-            time.monotonic_ns(),
++            scheduler_output.num_scheduled_tokens,
+         )
+ 
+     def post_forward(
+diff --git a/vllm/v1/worker/kv_connector_model_runner_mixin.py b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+index ab889100f14..f9cf8b4c024 100644
+--- a/vllm/v1/worker/kv_connector_model_runner_mixin.py
++++ b/vllm/v1/worker/kv_connector_model_runner_mixin.py
+@@ -4,7 +4,6 @@
+ Define KV connector functionality mixin for model runners.
+ """
+ 
+-import time
+ from collections.abc import Generator
+ from contextlib import AbstractContextManager, contextmanager, nullcontext
+ from typing import TYPE_CHECKING
+@@ -41,8 +40,7 @@ class KVConnectorModelRunnerMixin:
+         if not has_kv_transfer_group():
+             return
+         get_kv_transfer_group().observe_kv_recovery_first_compute(
+-            frozenset(scheduler_output.num_scheduled_tokens),
+-            time.monotonic_ns(),
++            scheduler_output.num_scheduled_tokens,
+         )
+ 
+     @staticmethod
+-- 
+2.53.0.windows.3
+

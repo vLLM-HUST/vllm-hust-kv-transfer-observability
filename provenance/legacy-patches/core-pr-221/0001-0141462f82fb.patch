@@ -1,0 +1,4086 @@
+From 0141462f82fb32f78129acccc996212296129eac Mon Sep 17 00:00:00 2001
+From: Remby Lis <153624059+Remygred@users.noreply.github.com>
+Date: Mon, 3 Aug 2026 10:04:20 +0000
+Subject: [PATCH] kv offload: add default-off recovery identity spine
+
+Assisted-by: Codex
+---
+ .../test_kv_recovery_scheduler.py             |  488 ++++++++
+ .../test_kv_recovery_worker.py                |  775 ++++++++++++
+ .../test_worker_metadata.py                   |   83 ++
+ tests/v1/test_kv_recovery_profile.py          |  834 +++++++++++++
+ .../kv_connector/v1/offloading/common.py      |   43 +
+ .../kv_connector/v1/offloading/scheduler.py   |  165 ++-
+ .../kv_connector/v1/offloading/worker.py      |  283 ++++-
+ .../kv_connector/v1/offloading_connector.py   |   26 +-
+ vllm/v1/kv_recovery_profile.py                | 1058 +++++++++++++++++
+ 9 files changed, 3737 insertions(+), 18 deletions(-)
+ create mode 100644 tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+ create mode 100644 tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+ create mode 100644 tests/v1/test_kv_recovery_profile.py
+ create mode 100644 vllm/v1/kv_recovery_profile.py
+
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+new file mode 100644
+index 0000000000..695951327e
+--- /dev/null
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_scheduler.py
+@@ -0,0 +1,488 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import hashlib
++
++import pytest
++
++import vllm.v1.kv_recovery_profile as recovery_profile
++from tests.v1.kv_connector.unit.offloading_connector.utils import (
++    generate_store_output,
++)
++from tests.v1.kv_connector.unit.utils import EOS_TOKEN_ID
++from vllm.distributed.kv_transfer.kv_connector.v1 import (
++    offloading_connector as offloading_connector_module,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
++    scheduler as scheduler_module,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
++    OffloadingWorkerMetadata,
++)
++from vllm.v1.kv_recovery_profile import (
++    KV_RECOVERY_PROFILE_BINDING,
++    KVRecoveryH2DReceipt,
++    KVRecoveryIdentity,
++    KVRecoveryLogicalBlock,
++    KVRecoveryTransferAttempt,
++    KVRecoveryTransferContext,
++    KVRecoveryWaitAttempt,
++    KVRecoveryWaitMembership,
++    canonical_block_set_id,
++)
++from vllm.v1.outputs import KVConnectorOutput
++
++pytestmark = pytest.mark.cpu_test
++
++
++class RecordingSchedulerObserver:
++    def __init__(self):
++        self.logical_ids: dict[tuple[str, int, int], str] = {}
++        self.contexts: list[KVRecoveryTransferContext] = []
++        self.receipt_batches: list[tuple[tuple[KVRecoveryH2DReceipt, ...], bool]] = []
++        self.reset_thresholds: list[int] = []
++        self.closed = False
++
++    def prepare_transfer_context(self, runtime_request_id, operation, coordinates):
++        trace_id = hashlib.sha256(runtime_request_id.encode()).hexdigest()[:32]
++        lifecycle_id = f"{trace_id}:e:0"
++        is_recovery = operation == "h2d_restore"
++        identity = KVRecoveryIdentity(
++            run_id="0" * 32,
++            trace_id=trace_id,
++            engine_lifecycle_id=lifecycle_id,
++            runtime_request_id=runtime_request_id,
++            recovery_epoch=1 if is_recovery else None,
++            episode_id=f"{lifecycle_id}:k:1" if is_recovery else None,
++            base_preempted_event_id=(f"{'b' * 32}:e:0" if is_recovery else None),
++        )
++        logical_blocks = tuple(
++            KVRecoveryLogicalBlock(
++                coordinate.group_index,
++                coordinate.logical_ordinal,
++                self.logical_ids.setdefault(
++                    (
++                        runtime_request_id,
++                        coordinate.group_index,
++                        coordinate.logical_ordinal,
++                    ),
++                    hashlib.sha256(
++                        (
++                            f"{runtime_request_id}:"
++                            f"{coordinate.group_index}:"
++                            f"{coordinate.logical_ordinal}"
++                        ).encode()
++                    ).hexdigest()[:32],
++                ),
++            )
++            for coordinate in coordinates
++        )
++        context = KVRecoveryTransferContext(
++            binding=KV_RECOVERY_PROFILE_BINDING,
++            identity=identity,
++            operation=operation,
++            block_set_id=canonical_block_set_id(
++                KV_RECOVERY_PROFILE_BINDING, identity, logical_blocks
++            ),
++            logical_blocks=logical_blocks,
++        )
++        self.contexts.append(context)
++        return context
++
++    def consume_h2d_receipts(self, receipts, receipts_truncated):
++        self.receipt_batches.append((receipts, receipts_truncated))
++
++    def reset(self, stale_job_threshold):
++        self.reset_thresholds.append(stale_job_threshold)
++
++    def close(self):
++        self.closed = True
++
++
++class RecordingWorkerObserver:
++    def __init__(self):
++        self.attempts: dict[int, KVRecoveryTransferAttempt] = {}
++        self.contexts: list[KVRecoveryTransferContext] = []
++        self.transfer_seq = 0
++        self.waits: list[KVRecoveryWaitAttempt] = []
++
++    def begin_transfer(self, connector_job_id, context):
++        attempt = KVRecoveryTransferAttempt(
++            connector_job_id=connector_job_id,
++            transfer_id=f"{'a' * 32}:t:{self.transfer_seq}",
++            context=context,
++        )
++        self.transfer_seq += 1
++        self.attempts[connector_job_id] = attempt
++        self.contexts.append(context)
++        return attempt
++
++    def transfer_submitted(self, attempt, timestamp_ns):
++        return None
++
++    def transfer_not_submitted(self, attempt):
++        self.attempts.pop(attempt.connector_job_id, None)
++
++    def transfer_completed(
++        self,
++        connector_job_id,
++        timestamp_ns,
++        success,
++        bytes_moved,
++        device_duration_ns,
++    ):
++        attempt = self.attempts.pop(connector_job_id, None)
++        if (
++            attempt is None
++            or attempt.context.operation != "h2d_restore"
++            or not success
++            or bytes_moved is None
++            or bytes_moved <= 0
++        ):
++            return None
++        return KVRecoveryH2DReceipt(
++            binding=attempt.context.binding,
++            connector_job_id=connector_job_id,
++            transfer_id=attempt.transfer_id,
++            identity=attempt.context.identity,
++            block_set_id=attempt.context.block_set_id,
++            process_uuid="a" * 32,
++            rank=0,
++            world_size=1,
++            clock_domain_id="c" * 32,
++            communication_done_event_id=(f"{'a' * 32}:e:{connector_job_id}"),
++            restore_done_profile_record_id=(f"{'a' * 32}:k:{connector_job_id}"),
++            timestamp_ns=timestamp_ns,
++            bytes_moved=bytes_moved,
++        )
++
++    def prepare_wait(self, connector_job_ids):
++        transfer_ids = tuple(
++            sorted(self.attempts[job_id].transfer_id for job_id in connector_job_ids)
++        )
++        return KVRecoveryWaitMembership(transfer_ids)
++
++    def wait_completed(self, attempt):
++        self.waits.append(attempt)
++
++    def h2d_receipt_truncated(self, receipt):
++        raise AssertionError("receipt transport unexpectedly truncated")
++
++    def close(self):
++        return None
++
++
++class RecordingFactory:
++    def __init__(self):
++        self.scheduler = RecordingSchedulerObserver()
++        self.worker = RecordingWorkerObserver()
++
++    def reinitialize_after_fork(self, binding):
++        assert binding == KV_RECOVERY_PROFILE_BINDING
++
++    def create_scheduler_observer(self, binding):
++        assert binding == KV_RECOVERY_PROFILE_BINDING
++        return self.scheduler
++
++    def create_worker_observer(self, binding):
++        assert binding == KV_RECOVERY_PROFILE_BINDING
++        return self.worker
++
++
++def enable_test_observer_factory(
++    monkeypatch: pytest.MonkeyPatch,
++    factory: RecordingFactory,
++) -> None:
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    monkeypatch.setattr(
++        offloading_connector_module,
++        "kv_recovery_runtime_scope_authorized",
++        lambda *args: True,
++    )
++    monkeypatch.setattr(recovery_profile, "_observer_factory", factory)
++
++
++def make_receipt(
++    context: KVRecoveryTransferContext,
++    connector_job_id: int,
++) -> KVRecoveryH2DReceipt:
++    return KVRecoveryH2DReceipt(
++        binding=context.binding,
++        connector_job_id=connector_job_id,
++        transfer_id=f"{'a' * 32}:t:{connector_job_id}",
++        identity=context.identity,
++        block_set_id=context.block_set_id,
++        process_uuid="a" * 32,
++        rank=0,
++        world_size=1,
++        clock_domain_id="c" * 32,
++        communication_done_event_id=f"{'a' * 32}:e:{connector_job_id}",
++        restore_done_profile_record_id=f"{'a' * 32}:k:{connector_job_id}",
++        timestamp_ns=10,
++        bytes_moved=128,
++    )
++
++
++@pytest.mark.parametrize("async_scheduling", [True, False])
++def test_pressure_preemption_preserves_identity_through_real_connector_path(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++    async_scheduling: bool,
++):
++    factory = RecordingFactory()
++    enable_test_observer_factory(monkeypatch, factory)
++
++    block_size = 4
++    block_size_factor = 3
++    offloaded_block_size = block_size * block_size_factor
++    runner = request_runner(
++        block_size=block_size,
++        num_gpu_blocks=100,
++        async_scheduling=async_scheduling,
++        block_size_factor=block_size_factor,
++    )
++
++    original_complete_transfers = runner.offloading_spec.complete_transfers
++
++    def complete_transfers_with_measurements():
++        original_complete_transfers()
++        for result in runner.offloading_spec.handler.completed_transfers:
++            result.transfer_size = 128
++            result.transfer_time = 0.25
++
++    runner.offloading_spec.complete_transfers = complete_transfers_with_measurements
++
++    free_blocks = runner.scheduler.kv_cache_manager.block_pool.free_block_queue
++    initial_free_blocks = free_blocks.num_free_blocks
++    runner.new_request(token_ids=[0] * offloaded_block_size * 2)
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    runner.run(decoded_tokens=[0], complete_transfers=False)
++
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    runner.run(
++        decoded_tokens=[0] * (2 * offloaded_block_size - block_size),
++        complete_transfers=False,
++    )
++
++    free_blocks.num_free_blocks = 0
++    runner.run(
++        decoded_tokens=[],
++        complete_transfers=False,
++        expected_flushed=tuple(range(9)),
++        expected_stored=tuple(range(9)),
++    )
++
++    free_blocks.num_free_blocks = initial_free_blocks
++    runner.scheduler.reset_prefix_cache()
++    runner.connector_scheduler._maximal_prefix_lookup = lambda key, context: 3
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    runner.run(
++        decoded_tokens=[0] * block_size,
++        expected_loaded=tuple(range(9)),
++    )
++
++    h2d_contexts = [
++        context
++        for context in factory.scheduler.contexts
++        if context.operation == "h2d_restore"
++    ]
++    assert len(h2d_contexts) == 1
++    assert h2d_contexts[0].coordinates == tuple(
++        recovery_profile.KVRecoveryBlockCoordinate(0, ordinal) for ordinal in range(3)
++    )
++    assert h2d_contexts[0] in factory.worker.contexts
++    d2h_blocks_by_coordinate = {
++        block.coordinate: block.logical_block_id
++        for context in factory.scheduler.contexts
++        if context.operation == "d2h_preserve"
++        for block in context.logical_blocks
++    }
++    assert {
++        block.coordinate: block.logical_block_id
++        for block in h2d_contexts[0].logical_blocks
++    }.items() <= d2h_blocks_by_coordinate.items()
++
++    receipts = [
++        receipt
++        for batch, truncated in factory.scheduler.receipt_batches
++        if not truncated
++        for receipt in batch
++    ]
++    assert len(receipts) == 1
++    assert receipts[0].identity == h2d_contexts[0].identity
++    assert receipts[0].block_set_id == h2d_contexts[0].block_set_id
++
++
++def test_scheduler_observer_failure_is_fail_open(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    class RaisingSchedulerObserver(RecordingSchedulerObserver):
++        def prepare_transfer_context(self, *args, **kwargs):
++            raise RuntimeError("observer failed")
++
++    factory = RecordingFactory()
++    factory.scheduler = RaisingSchedulerObserver()
++    enable_test_observer_factory(monkeypatch, factory)
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++    )
++
++    runner.new_request(token_ids=[0] * 4)
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
++
++    assert factory.worker.contexts == []
++
++
++def test_malformed_scheduler_observer_return_is_fail_open(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    class MalformedSchedulerObserver(RecordingSchedulerObserver):
++        def prepare_transfer_context(self, *args, **kwargs):
++            return object()
++
++    factory = RecordingFactory()
++    factory.scheduler = MalformedSchedulerObserver()
++    enable_test_observer_factory(monkeypatch, factory)
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++    )
++    runner.new_request(token_ids=[0] * 4)
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++
++    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
++
++    assert factory.worker.contexts == []
++
++
++@pytest.mark.parametrize("operation", ["h2d_restore", "d2h_preserve"])
++def test_recovery_coordinate_capture_is_bounded_by_one_overflow_sentinel(
++    operation: str,
++):
++    observed_lengths: list[int] = []
++
++    class OverboundObserver(RecordingSchedulerObserver):
++        def prepare_transfer_context(
++            self,
++            runtime_request_id,
++            observed_operation,
++            coordinates,
++        ):
++            assert observed_operation == operation
++            observed_lengths.append(len(coordinates))
++            return None
++
++    coordinates = []
++    for ordinal in range(recovery_profile.MAX_LOGICAL_BLOCKS_PER_SET + 100):
++        scheduler_module.OffloadingConnectorScheduler._append_kv_recovery_coordinate(
++            coordinates,
++            0,
++            ordinal,
++        )
++
++    assert len(coordinates) == recovery_profile.MAX_LOGICAL_BLOCKS_PER_SET + 1
++    scheduler = object.__new__(scheduler_module.OffloadingConnectorScheduler)
++    scheduler._kv_recovery_observer = OverboundObserver()
++    assert (
++        scheduler._prepare_kv_recovery_context(
++            "request-0",
++            operation,  # type: ignore[arg-type]
++            coordinates,
++        )
++        is None
++    )
++    assert observed_lengths == [recovery_profile.MAX_LOGICAL_BLOCKS_PER_SET + 1]
++
++
++def test_disabled_scheduler_never_constructs_recovery_coordinates(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    def unexpected_coordinate(*args, **kwargs):
++        raise AssertionError("hard-off scheduler constructed recovery identity")
++
++    monkeypatch.setattr(
++        scheduler_module,
++        "KVRecoveryBlockCoordinate",
++        unexpected_coordinate,
++    )
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++    )
++    runner.new_request(token_ids=[0] * 4)
++    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
++        generate_store_output(keys)
++    )
++
++    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
++
++
++def test_reset_notifies_observer_and_filters_stale_or_unmatched_receipts(
++    request_runner,
++    monkeypatch: pytest.MonkeyPatch,
++):
++    factory = RecordingFactory()
++    enable_test_observer_factory(monkeypatch, factory)
++    runner = request_runner(
++        block_size=4,
++        num_gpu_blocks=100,
++        async_scheduling=False,
++    )
++    scheduler = runner.connector_scheduler
++    context = factory.scheduler.prepare_transfer_context(
++        "request-0",
++        "h2d_restore",
++        (recovery_profile.KVRecoveryBlockCoordinate(0, 0),),
++    )
++
++    scheduler._stale_job_threshold = 10
++    scheduler.update_connector_output(
++        KVConnectorOutput(
++            kv_connector_worker_meta=OffloadingWorkerMetadata(
++                kv_recovery_h2d_receipts=(make_receipt(context, 9),),
++            )
++        )
++    )
++    assert factory.scheduler.receipt_batches == []
++
++    scheduler.update_connector_output(
++        KVConnectorOutput(
++            kv_connector_worker_meta=OffloadingWorkerMetadata(
++                kv_recovery_h2d_receipts=(make_receipt(context, 10),),
++            )
++        )
++    )
++    assert factory.scheduler.receipt_batches == [((), True)]
++
++    scheduler.update_connector_output(
++        KVConnectorOutput(
++            kv_connector_worker_meta=OffloadingWorkerMetadata(
++                kv_recovery_h2d_receipts=(object(),),  # type: ignore[arg-type]
++            )
++        )
++    )
++    assert factory.scheduler.receipt_batches == [((), True), ((), True)]
++
++    scheduler.reset_cache()
++    assert factory.scheduler.reset_thresholds == [scheduler._stale_job_threshold]
++
++    scheduler.shutdown()
++    assert factory.scheduler.closed
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+new file mode 100644
+index 0000000000..aa3c13f94f
+--- /dev/null
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_kv_recovery_worker.py
+@@ -0,0 +1,775 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pickle
++from collections.abc import Iterable
++
++import pytest
++
++import vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker as worker_module
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
++    OffloadingConnectorMetadata,
++    TransferJob,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
++    OffloadingConnectorWorker,
++)
++from vllm.v1.kv_offload.base import (
++    GPULoadStoreSpec,
++    LoadStoreSpec,
++    TransferResult,
++)
++from vllm.v1.kv_recovery_profile import (
++    KV_RECOVERY_PROFILE_BINDING,
++    MAX_PENDING_H2D_CONTEXTS_PER_PROCESS,
++    MAX_TRANSFER_IDS_PER_WAIT_SET,
++    BoundedKVRecoveryWorkerObserver,
++    KVRecoveryH2DReceipt,
++    KVRecoveryIdentity,
++    KVRecoveryLogicalBlock,
++    KVRecoveryTransferAttempt,
++    KVRecoveryTransferContext,
++    KVRecoveryWaitAttempt,
++    KVRecoveryWaitMembership,
++    canonical_block_set_id,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++
++class CPULoadStoreSpec(LoadStoreSpec):
++    @staticmethod
++    def medium() -> str:
++        return "CPU"
++
++
++class RecordingBackend:
++    def __init__(self, events: list[tuple]):
++        self.events = events
++        self.finished: list[TransferResult] = []
++        self.submit_load_result = True
++        self.submit_store_result = True
++        self.wait_error: Exception | None = None
++        self.shutdown_error: Exception | None = None
++        self.shutdown_called = False
++
++    def submit_load(self, job_id, src_spec, dst_spec):
++        self.events.append(("backend_submit_load", job_id, src_spec, dst_spec))
++        return self.submit_load_result
++
++    def submit_store(self, job_id, src_spec, dst_spec):
++        self.events.append(("backend_submit_store", job_id, src_spec, dst_spec))
++        return self.submit_store_result
++
++    def get_finished(self):
++        finished = self.finished
++        self.finished = []
++        return finished
++
++    def wait(self, job_ids):
++        self.events.append(("backend_wait", frozenset(job_ids)))
++        if self.wait_error is not None:
++            raise self.wait_error
++
++    def shutdown(self):
++        self.shutdown_called = True
++        if self.shutdown_error is not None:
++            raise self.shutdown_error
++
++
++class RecordingObserver:
++    def __init__(self, events: list[tuple], raise_at: str | None = None):
++        self.events = events
++        self.raise_at = raise_at
++        self.attempts: dict[int, KVRecoveryTransferAttempt] = {}
++        self.transfer_seq = 0
++        self.wait_completed_calls: list[KVRecoveryWaitAttempt] = []
++        self.receipt_truncations: list[KVRecoveryH2DReceipt] = []
++        self.closed = False
++
++    def _raise_if_requested(self, stage: str):
++        if self.raise_at == stage:
++            raise RuntimeError(stage)
++
++    def begin_transfer(self, connector_job_id, context):
++        self._raise_if_requested("begin_transfer")
++        self.events.append(("observer_begin", connector_job_id, context))
++        attempt = KVRecoveryTransferAttempt(
++            connector_job_id=connector_job_id,
++            transfer_id=f"{'a' * 32}:t:{self.transfer_seq}",
++            context=context,
++        )
++        self.transfer_seq += 1
++        self.attempts[connector_job_id] = attempt
++        return attempt
++
++    def transfer_submitted(self, attempt, timestamp_ns):
++        self._raise_if_requested("transfer_submitted")
++        self.events.append(("observer_submitted", attempt.connector_job_id))
++
++    def transfer_not_submitted(self, attempt):
++        self._raise_if_requested("transfer_not_submitted")
++        self.attempts.pop(attempt.connector_job_id, None)
++        self.events.append(("observer_not_submitted", attempt.connector_job_id))
++
++    def transfer_completed(
++        self,
++        connector_job_id,
++        timestamp_ns,
++        success,
++        bytes_moved,
++        device_duration_ns,
++    ):
++        self._raise_if_requested("transfer_completed")
++        self.events.append(
++            (
++                "observer_completed",
++                connector_job_id,
++                success,
++                bytes_moved,
++                device_duration_ns,
++            )
++        )
++        attempt = self.attempts.pop(connector_job_id, None)
++        if (
++            attempt is None
++            or attempt.context.operation != "h2d_restore"
++            or not success
++            or bytes_moved is None
++            or bytes_moved <= 0
++        ):
++            return None
++        return KVRecoveryH2DReceipt(
++            binding=attempt.context.binding,
++            connector_job_id=connector_job_id,
++            transfer_id=attempt.transfer_id,
++            identity=attempt.context.identity,
++            block_set_id=attempt.context.block_set_id,
++            process_uuid="a" * 32,
++            rank=0,
++            world_size=1,
++            clock_domain_id="c" * 32,
++            communication_done_event_id=(f"{'a' * 32}:e:{connector_job_id}"),
++            restore_done_profile_record_id=(f"{'a' * 32}:k:{connector_job_id}"),
++            timestamp_ns=timestamp_ns,
++            bytes_moved=bytes_moved,
++        )
++
++    def prepare_wait(self, connector_job_ids):
++        self._raise_if_requested("prepare_wait")
++        self.events.append(("observer_prepare_wait", frozenset(connector_job_ids)))
++        transfer_ids = tuple(
++            sorted(self.attempts[job_id].transfer_id for job_id in connector_job_ids)
++        )
++        return KVRecoveryWaitMembership(transfer_ids)
++
++    def wait_completed(self, attempt):
++        self._raise_if_requested("wait_completed")
++        self.events.append(("observer_wait_completed", attempt.transfer_ids))
++        self.wait_completed_calls.append(attempt)
++
++    def h2d_receipt_truncated(self, receipt):
++        self.receipt_truncations.append(receipt)
++
++    def close(self):
++        self._raise_if_requested("close")
++        self.closed = True
++
++
++class RecordingEvidenceSink:
++    def __init__(self):
++        self.submissions: list[tuple[KVRecoveryTransferAttempt, int]] = []
++        self.not_submitted: list[KVRecoveryTransferAttempt] = []
++        self.completions: list[int] = []
++        self.capacity_losses: list[tuple[KVRecoveryTransferAttempt, int, str]] = []
++        self.failures: list[tuple[str, tuple[int, ...]]] = []
++        self.waits: list[KVRecoveryWaitAttempt] = []
++        self.truncated: list[KVRecoveryH2DReceipt] = []
++        self.close_calls: list[tuple[tuple[KVRecoveryTransferAttempt, ...], bool]] = []
++
++    def transfer_submitted(self, attempt, timestamp_ns):
++        self.submissions.append((attempt, timestamp_ns))
++
++    def transfer_not_submitted(self, attempt):
++        self.not_submitted.append(attempt)
++
++    def transfer_completed(
++        self,
++        attempt,
++        submit_timestamp_ns,
++        timestamp_ns,
++        success,
++        bytes_moved,
++        device_duration_ns,
++    ):
++        self.completions.append(attempt.connector_job_id)
++        if (
++            attempt.context.operation != "h2d_restore"
++            or not success
++            or bytes_moved is None
++            or bytes_moved <= 0
++        ):
++            return None
++        return KVRecoveryH2DReceipt(
++            binding=attempt.context.binding,
++            connector_job_id=attempt.connector_job_id,
++            transfer_id=attempt.transfer_id,
++            identity=attempt.context.identity,
++            block_set_id=attempt.context.block_set_id,
++            process_uuid="a" * 32,
++            rank=0,
++            world_size=1,
++            clock_domain_id="c" * 32,
++            communication_done_event_id=(f"{'a' * 32}:e:{attempt.connector_job_id}"),
++            restore_done_profile_record_id=(f"{'a' * 32}:k:{attempt.connector_job_id}"),
++            timestamp_ns=timestamp_ns,
++            bytes_moved=bytes_moved,
++        )
++
++    def pending_h2d_capacity_exhausted(self, attempt, timestamp_ns, loss_reason):
++        self.capacity_losses.append((attempt, timestamp_ns, loss_reason))
++
++    def evidence_failure(
++        self,
++        reason,
++        connector_job_ids,
++        transfer_ids,
++        timestamp_ns,
++    ):
++        self.failures.append((reason, connector_job_ids))
++
++    def wait_completed(self, attempt):
++        self.waits.append(attempt)
++
++    def h2d_receipt_truncated(self, receipt):
++        self.truncated.append(receipt)
++
++    def close(self, open_attempts, evidence_disabled):
++        self.close_calls.append((open_attempts, evidence_disabled))
++
++
++def make_context(operation: str) -> KVRecoveryTransferContext:
++    trace_id = "1" * 32
++    lifecycle_id = f"{trace_id}:e:0"
++    is_recovery = operation == "h2d_restore"
++    identity = KVRecoveryIdentity(
++        run_id="0" * 32,
++        trace_id=trace_id,
++        engine_lifecycle_id=lifecycle_id,
++        runtime_request_id="request-0",
++        recovery_epoch=1 if is_recovery else None,
++        episode_id=f"{lifecycle_id}:k:1" if is_recovery else None,
++        base_preempted_event_id=f"{'b' * 32}:e:0" if is_recovery else None,
++    )
++    logical_blocks = (KVRecoveryLogicalBlock(0, 0, "b" * 32),)
++    return KVRecoveryTransferContext(
++        binding=KV_RECOVERY_PROFILE_BINDING,
++        identity=identity,
++        operation=operation,  # type: ignore[arg-type]
++        block_set_id=canonical_block_set_id(
++            KV_RECOVERY_PROFILE_BINDING, identity, logical_blocks
++        ),
++        logical_blocks=logical_blocks,
++    )
++
++
++def make_load_job() -> TransferJob:
++    return TransferJob(
++        req_id="request-0",
++        src_spec=CPULoadStoreSpec(),
++        dst_spec=GPULoadStoreSpec([3], group_sizes=[1], block_indices=[0]),
++    )
++
++
++def make_store_job() -> TransferJob:
++    return TransferJob(
++        req_id="request-0",
++        src_spec=GPULoadStoreSpec([3], group_sizes=[1], block_indices=[0]),
++        dst_spec=CPULoadStoreSpec(),
++    )
++
++
++def make_worker(observer=None):
++    events: list[tuple] = []
++    backend = RecordingBackend(events)
++    worker = OffloadingConnectorWorker(
++        spec=object(),  # type: ignore[arg-type]
++        kv_recovery_observer=observer,
++    )
++    worker.worker = backend  # type: ignore[assignment]
++    return worker, backend, events
++
++
++def metadata(
++    *,
++    load_jobs: Iterable[tuple[int, TransferJob]] = (),
++    store_jobs: Iterable[tuple[int, TransferJob]] = (),
++    jobs_to_flush: set[int] | None = None,
++    kv_recovery_contexts: Iterable[tuple[int, KVRecoveryTransferContext]] = (),
++) -> OffloadingConnectorMetadata:
++    contexts = dict(kv_recovery_contexts)
++    return OffloadingConnectorMetadata(
++        load_jobs=dict(load_jobs),
++        store_jobs=dict(store_jobs),
++        jobs_to_flush=jobs_to_flush,
++        kv_recovery_contexts=contexts or None,
++    )
++
++
++def test_transfer_job_remains_backward_compatible():
++    src_spec = CPULoadStoreSpec()
++    dst_spec = CPULoadStoreSpec()
++
++    job = TransferJob("request-0", src_spec, dst_spec)
++
++    assert job.req_id == "request-0"
++    assert job.src_spec is src_spec
++    assert job.dst_spec is dst_spec
++    assert not hasattr(job, "kv_recovery_context")
++
++
++def test_connector_metadata_sidecar_round_trips_and_defaults_off():
++    job = make_load_job()
++    context = make_context("h2d_restore")
++    disabled = metadata(load_jobs=((7, job),))
++    active = metadata(
++        load_jobs=((7, job),),
++        kv_recovery_contexts=((7, context),),
++    )
++
++    disabled_copy = pickle.loads(pickle.dumps(disabled))
++    active_copy = pickle.loads(pickle.dumps(active))
++
++    assert disabled_copy.kv_recovery_contexts is None
++    assert active_copy.kv_recovery_contexts == {7: context}
++
++
++def test_disabled_worker_path_preserves_load_semantics():
++    worker, backend, events = make_worker()
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++    finished_sending, finished_recving = worker.get_finished(set())
++    worker_meta = worker.build_connector_worker_meta()
++
++    assert events == [("backend_submit_load", 7, job.src_spec, job.dst_spec)]
++    assert finished_sending == set()
++    assert finished_recving == {"request-0"}
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {7: 1}
++    assert worker_meta.transfer_stats.load.bytes == 128
++    assert worker_meta.kv_recovery_h2d_receipts == ()
++    assert not worker_meta.kv_recovery_h2d_receipts_truncated
++
++
++def test_disabled_worker_path_does_not_read_profile_clock(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    worker, backend, _ = make_worker()
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    def unexpected_clock_read():
++        raise AssertionError("disabled KV-recovery path read the clock")
++
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", unexpected_clock_read)
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++
++    assert worker.get_finished(set()) == (set(), {"request-0"})
++
++
++def test_submit_clock_failure_keeps_serving_but_cannot_emit_receipt(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++
++    def unavailable_clock():
++        raise RuntimeError("clock unavailable")
++
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", unavailable_clock)
++    context = make_context("h2d_restore")
++    job = make_load_job()
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++
++    assert worker.get_finished(set()) == (set(), {"request-0"})
++    worker_meta = worker.build_connector_worker_meta()
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {7: 1}
++    assert worker_meta.kv_recovery_h2d_receipts == ()
++    assert not any(event[0] == "observer_completed" for event in events)
++
++
++def test_h2d_sidecar_reaches_submit_completion_and_scheduler_receipt():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++    _, finished_recving = worker.get_finished(set())
++    worker_meta = worker.build_connector_worker_meta()
++
++    assert [event[0] for event in events[:3]] == [
++        "observer_begin",
++        "backend_submit_load",
++        "observer_submitted",
++    ]
++    assert finished_recving == {"request-0"}
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {7: 1}
++    assert len(worker_meta.kv_recovery_h2d_receipts) == 1
++    receipt = worker_meta.kv_recovery_h2d_receipts[0]
++    assert receipt.connector_job_id == 7
++    assert receipt.identity == context.identity
++    assert receipt.block_set_id == context.block_set_id
++    assert events[-1] == ("observer_completed", 7, True, 128, 250_000_000)
++
++
++def test_submit_and_completion_clocks_are_first_profile_observations(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    original_get_finished = backend.get_finished
++
++    def observed_get_finished():
++        events.append(("backend_get_finished",))
++        return original_get_finished()
++
++    timestamps = iter((10, 20))
++
++    def observed_clock():
++        timestamp_ns = next(timestamps)
++        events.append(("profile_clock", timestamp_ns))
++        return timestamp_ns
++
++    backend.get_finished = observed_get_finished  # type: ignore[method-assign]
++    monkeypatch.setattr(worker_module.time, "monotonic_ns", observed_clock)
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++    worker.get_finished(set())
++
++    assert [event[0] for event in events] == [
++        "observer_begin",
++        "backend_submit_load",
++        "profile_clock",
++        "observer_submitted",
++        "backend_get_finished",
++        "profile_clock",
++        "observer_completed",
++    ]
++    assert observer.wait_completed_calls == []
++
++
++def test_deferred_store_keeps_full_job_and_submits_before_load():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    store_context = make_context("d2h_preserve")
++    load_context = make_context("h2d_restore")
++    store_job = make_store_job()
++    load_job = make_load_job()
++
++    worker.prepare_store_kv(
++        metadata(
++            store_jobs=((3, store_job),),
++            kv_recovery_contexts=((3, store_context),),
++        )
++    )
++    assert worker._unsubmitted_store_jobs == [
++        (3, store_job.src_spec, store_job.dst_spec)
++    ]
++    assert events == []
++
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, load_job),),
++            kv_recovery_contexts=((7, load_context),),
++        )
++    )
++    worker.start_kv_transfers(metadata())
++
++    backend_calls = [event for event in events if event[0].startswith("backend_")]
++    assert backend_calls == [
++        ("backend_submit_store", 3, store_job.src_spec, store_job.dst_spec),
++        ("backend_submit_load", 7, load_job.src_spec, load_job.dst_spec),
++    ]
++    assert [event[2] for event in events if event[0] == "observer_begin"] == [
++        store_context,
++        load_context,
++    ]
++
++
++@pytest.mark.parametrize(
++    "raise_at",
++    ["begin_transfer", "transfer_submitted", "transfer_completed"],
++)
++def test_observer_transfer_failure_does_not_change_serving(raise_at: str):
++    events: list[tuple] = []
++    observer = RecordingObserver(events, raise_at=raise_at)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++    _, finished_recving = worker.get_finished(set())
++    worker_meta = worker.build_connector_worker_meta()
++
++    assert finished_recving == {"request-0"}
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {7: 1}
++    assert worker_meta.kv_recovery_h2d_receipts == ()
++    assert [event[0] for event in events].count("backend_submit_load") == 1
++
++
++@pytest.mark.parametrize("malformed_stage", ["begin", "completion"])
++def test_malformed_worker_observer_return_does_not_change_serving(
++    malformed_stage: str,
++):
++    class MalformedObserver(RecordingObserver):
++        def begin_transfer(self, connector_job_id, context):
++            if malformed_stage == "begin":
++                return object()
++            return super().begin_transfer(connector_job_id, context)
++
++        def transfer_completed(self, *args, **kwargs):
++            if malformed_stage == "completion":
++                return object()
++            return super().transfer_completed(*args, **kwargs)
++
++    events: list[tuple] = []
++    observer = MalformedObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    worker.start_kv_transfers(
++        metadata(
++            load_jobs=((7, job),),
++            kv_recovery_contexts=((7, context),),
++        )
++    )
++    backend.finished.append(TransferResult(7, True, 128, 0.25))
++
++    assert worker.get_finished(set()) == (set(), {"request-0"})
++    worker_meta = worker.build_connector_worker_meta()
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {7: 1}
++    assert worker_meta.kv_recovery_h2d_receipts == ()
++
++
++def test_backend_submit_rejection_keeps_existing_assertion_semantics():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    backend.submit_load_result = False
++    context = make_context("h2d_restore")
++    job = make_load_job()
++
++    with pytest.raises(AssertionError):
++        worker.start_kv_transfers(
++            metadata(
++                load_jobs=((7, job),),
++                kv_recovery_contexts=((7, context),),
++            )
++        )
++
++    assert [event[0] for event in events] == [
++        "observer_begin",
++        "backend_submit_load",
++        "observer_not_submitted",
++    ]
++
++
++def test_wait_observer_is_fail_open_but_backend_error_is_preserved():
++    events: list[tuple] = []
++    observer = RecordingObserver(events, raise_at="prepare_wait")
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++
++    worker.handle_preemptions(metadata(jobs_to_flush={3, 4}))
++    assert events == [("backend_wait", frozenset({3, 4}))]
++
++    backend.wait_error = RuntimeError("backend wait failed")
++    with pytest.raises(RuntimeError, match="backend wait failed"):
++        worker.handle_preemptions(metadata(jobs_to_flush={3, 4}))
++
++
++def test_malformed_wait_membership_does_not_change_backend_wait():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    observer.prepare_wait = lambda connector_job_ids: object()  # type: ignore[method-assign]
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++
++    worker.handle_preemptions(metadata(jobs_to_flush={3}))
++
++    assert events == [("backend_wait", frozenset({3}))]
++    assert observer.wait_completed_calls == []
++
++
++def test_overbound_wait_caps_profiler_copy_but_preserves_backend_membership():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    observed_sizes: list[int] = []
++
++    def prepare_overbound_wait(connector_job_ids):
++        observed_sizes.append(len(connector_job_ids))
++        return None
++
++    observer.prepare_wait = prepare_overbound_wait  # type: ignore[method-assign]
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    job_ids = set(range(MAX_TRANSFER_IDS_PER_WAIT_SET + 10_000))
++
++    worker.handle_preemptions(metadata(jobs_to_flush=job_ids))
++
++    assert observed_sizes == [MAX_TRANSFER_IDS_PER_WAIT_SET + 1]
++    assert events == [("backend_wait", frozenset(job_ids))]
++
++
++def test_successful_wait_preparation_is_not_recorded_when_backend_raises():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    observer.begin_transfer(3, make_context("d2h_preserve"))
++    backend.wait_error = RuntimeError("backend wait failed")
++
++    with pytest.raises(RuntimeError, match="backend wait failed"):
++        worker.handle_preemptions(metadata(jobs_to_flush={3}))
++
++    assert events[-2:] == [
++        ("observer_prepare_wait", frozenset({3})),
++        ("backend_wait", frozenset({3})),
++    ]
++    assert observer.wait_completed_calls == []
++
++
++def test_device_duration_overflow_is_unavailable():
++    assert OffloadingConnectorWorker._device_duration_ns(1e308) is None
++
++
++def test_observer_closes_even_when_backend_shutdown_raises():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.shutdown_error = RuntimeError("backend shutdown failed")
++
++    with pytest.raises(RuntimeError, match="backend shutdown failed"):
++        worker.shutdown()
++
++    assert backend.shutdown_called
++    assert observer.closed
++
++
++def test_successful_wait_is_recorded_only_after_backend_returns():
++    events: list[tuple] = []
++    observer = RecordingObserver(events)
++    worker, backend, _ = make_worker(observer)
++    backend.events = events
++    context = make_context("d2h_preserve")
++    observer.begin_transfer(3, context)
++
++    worker.handle_preemptions(metadata(jobs_to_flush={3}))
++
++    assert events[-3:] == [
++        ("observer_prepare_wait", frozenset({3})),
++        ("backend_wait", frozenset({3})),
++        ("observer_wait_completed", (f"{'a' * 32}:t:0",)),
++    ]
++    assert len(observer.wait_completed_calls) == 1
++    assert observer.wait_completed_calls[0].transfer_ids == (f"{'a' * 32}:t:0",)
++
++
++def test_4097th_h2d_keeps_serving_and_records_one_capacity_loss():
++    sink = RecordingEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver("a" * 32, "0" * 32, "c" * 32, sink)
++    worker, backend, events = make_worker(observer)
++    context = make_context("h2d_restore")
++    job = make_load_job()
++    total_jobs = MAX_PENDING_H2D_CONTEXTS_PER_PROCESS + 1
++    jobs = tuple((job_id, job) for job_id in range(total_jobs))
++    contexts = tuple((job_id, context) for job_id in range(total_jobs))
++
++    worker.start_kv_transfers(metadata(load_jobs=jobs, kv_recovery_contexts=contexts))
++
++    assert len(events) == total_jobs
++    assert all(event[0] == "backend_submit_load" for event in events)
++    assert observer.transfer_seq == total_jobs
++    assert observer.pending_h2d_count == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++    assert len(sink.submissions) == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++    assert len(sink.capacity_losses) == 1
++    dropped_attempt, _, loss_reason = sink.capacity_losses[0]
++    assert dropped_attempt.connector_job_id == total_jobs - 1
++    assert loss_reason == "serialization_failure"
++    assert sink.failures == []
++    assert observer.evidence_disabled
++
++    backend.finished.append(TransferResult(total_jobs - 1, True, 128, 0.25))
++    assert worker.get_finished(set()) == (set(), {"request-0"})
++    worker_meta = worker.build_connector_worker_meta()
++
++    assert worker_meta is not None
++    assert worker_meta.completed_jobs == {total_jobs - 1: 1}
++    assert worker_meta.kv_recovery_h2d_receipts == ()
++    assert sink.completions == []
++    assert len(sink.capacity_losses) == 1
++    assert sink.failures == []
++
++    worker.shutdown()
++    observer.close()
++    assert len(sink.close_calls) == 1
++    open_attempts, evidence_disabled = sink.close_calls[0]
++    assert len(open_attempts) == MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++    assert evidence_disabled
+diff --git a/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py b/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
+index 2f56ede5b8..a707fb3100 100644
+--- a/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
++++ b/tests/v1/kv_connector/unit/offloading_connector/test_worker_metadata.py
+@@ -8,10 +8,45 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
+     OffloadingWorkerMetadata,
+     TransferStats,
+ )
++from vllm.v1.kv_recovery_profile import (
++    KV_RECOVERY_PROFILE_BINDING,
++    MAX_H2D_RECEIPTS_PER_WORKER_STEP,
++    KVRecoveryH2DReceipt,
++    KVRecoveryIdentity,
++)
+ 
+ pytestmark = pytest.mark.cpu_test
+ 
+ 
++def make_receipt(job_id: int = 42) -> KVRecoveryH2DReceipt:
++    trace_id = "1" * 32
++    lifecycle_id = f"{trace_id}:e:0"
++    identity = KVRecoveryIdentity(
++        run_id="0" * 32,
++        trace_id=trace_id,
++        engine_lifecycle_id=lifecycle_id,
++        runtime_request_id="request-0",
++        recovery_epoch=1,
++        episode_id=f"{lifecycle_id}:k:1",
++        base_preempted_event_id=f"{'b' * 32}:e:0",
++    )
++    return KVRecoveryH2DReceipt(
++        binding=KV_RECOVERY_PROFILE_BINDING,
++        connector_job_id=job_id,
++        transfer_id=f"{'a' * 32}:t:{job_id}",
++        identity=identity,
++        block_set_id="b" * 64,
++        process_uuid="a" * 32,
++        rank=0,
++        world_size=1,
++        clock_domain_id="c" * 32,
++        communication_done_event_id=f"{'a' * 32}:e:{job_id}",
++        restore_done_profile_record_id=f"{'a' * 32}:k:{job_id}",
++        timestamp_ns=10,
++        bytes_moved=128,
++    )
++
++
+ def test_aggregate_sums_counts():
+     meta1 = OffloadingWorkerMetadata(completed_jobs={42: 1, 7: 1})
+     meta2 = OffloadingWorkerMetadata(completed_jobs={42: 1, 7: 1})
+@@ -51,3 +86,51 @@ def test_aggregate_transfer_stats():
+     assert result.transfer_stats.load.bytes == 30
+     assert result.transfer_stats.load.time == 1.5
+     assert result.transfer_stats.load.sizes == [10, 20, 30]
++
++
++def test_add_h2d_receipt_does_not_change_completion_counts():
++    meta = OffloadingWorkerMetadata(completed_jobs={42: 1})
++    receipt = make_receipt()
++
++    assert meta.add_kv_recovery_h2d_receipt(receipt)
++    assert meta.completed_jobs == {42: 1}
++    assert meta.kv_recovery_h2d_receipts == (receipt,)
++    assert not meta.kv_recovery_h2d_receipts_truncated
++
++
++def test_aggregate_preserves_duplicate_receipts_for_exact_one_validation():
++    receipt = make_receipt()
++    meta1 = OffloadingWorkerMetadata(
++        completed_jobs={42: 1},
++        kv_recovery_h2d_receipts=(receipt,),
++    )
++    meta2 = OffloadingWorkerMetadata(
++        completed_jobs={42: 1},
++        kv_recovery_h2d_receipts=(receipt,),
++    )
++
++    result = meta1.aggregate(meta2)
++
++    assert result.completed_jobs == {42: 2}
++    assert result.kv_recovery_h2d_receipts == (receipt, receipt)
++    assert not result.kv_recovery_h2d_receipts_truncated
++    assert meta1.completed_jobs == {42: 1}
++    assert meta2.completed_jobs == {42: 1}
++
++
++def test_aggregate_bounds_receipts_without_affecting_serving_metadata():
++    receipt = make_receipt()
++    meta1 = OffloadingWorkerMetadata(
++        completed_jobs={42: 1},
++        kv_recovery_h2d_receipts=(receipt,) * MAX_H2D_RECEIPTS_PER_WORKER_STEP,
++    )
++    meta2 = OffloadingWorkerMetadata(
++        completed_jobs={42: 1},
++        kv_recovery_h2d_receipts=(receipt,),
++    )
++
++    result = meta1.aggregate(meta2)
++
++    assert result.completed_jobs == {42: 2}
++    assert len(result.kv_recovery_h2d_receipts) == (MAX_H2D_RECEIPTS_PER_WORKER_STEP)
++    assert result.kv_recovery_h2d_receipts_truncated
+diff --git a/tests/v1/test_kv_recovery_profile.py b/tests/v1/test_kv_recovery_profile.py
+new file mode 100644
+index 0000000000..cd7e927629
+--- /dev/null
++++ b/tests/v1/test_kv_recovery_profile.py
+@@ -0,0 +1,834 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++import pickle
++import select
++import signal
++import sys
++import threading
++from dataclasses import replace
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++
++import vllm.v1.kv_recovery_profile as recovery_profile
++from vllm.v1.kv_recovery_profile import (
++    KV_RECOVERY_PROFILE_BINDING,
++    BoundedKVRecoveryWorkerObserver,
++    KVRecoveryBlockCoordinate,
++    KVRecoveryH2DReceipt,
++    KVRecoveryIdentity,
++    KVRecoveryLogicalBlock,
++    KVRecoveryTransferAttempt,
++    KVRecoveryTransferContext,
++    KVRecoveryWaitAttempt,
++    canonical_block_set_id,
++    create_kv_recovery_scheduler_observer,
++    create_kv_recovery_worker_observer,
++    prepare_kv_recovery_profile_after_fork,
++    register_kv_recovery_observer_factory,
++    reinitialize_kv_recovery_profile_after_fork,
++)
++
++pytestmark = pytest.mark.cpu_test
++
++PROCESS_UUID = "a" * 32
++RUN_ID = "0" * 32
++CLOCK_DOMAIN_ID = "c" * 32
++
++
++@pytest.fixture(autouse=True)
++def reset_observer_factory(monkeypatch: pytest.MonkeyPatch):
++    monkeypatch.setattr(recovery_profile, "_observer_factory", None)
++
++
++def make_identity(*, recovery: bool = True) -> KVRecoveryIdentity:
++    trace_id = "1" * 32
++    lifecycle_id = f"{trace_id}:e:0"
++    return KVRecoveryIdentity(
++        run_id="0" * 32,
++        trace_id=trace_id,
++        engine_lifecycle_id=lifecycle_id,
++        runtime_request_id="request-0",
++        recovery_epoch=1 if recovery else None,
++        episode_id=f"{lifecycle_id}:k:1" if recovery else None,
++        base_preempted_event_id=f"{'b' * 32}:e:0" if recovery else None,
++    )
++
++
++def make_context(*, operation: str = "h2d_restore") -> KVRecoveryTransferContext:
++    identity = make_identity(recovery=operation == "h2d_restore")
++    logical_blocks = (
++        KVRecoveryLogicalBlock(0, 2, "2" * 32),
++        KVRecoveryLogicalBlock(1, 3, "3" * 32),
++    )
++    return KVRecoveryTransferContext(
++        binding=KV_RECOVERY_PROFILE_BINDING,
++        identity=identity,
++        operation=operation,  # type: ignore[arg-type]
++        block_set_id=canonical_block_set_id(
++            KV_RECOVERY_PROFILE_BINDING, identity, logical_blocks
++        ),
++        logical_blocks=logical_blocks,
++    )
++
++
++def make_receipt(
++    *,
++    transfer_id: str | None = None,
++    process_uuid: str = "a" * 32,
++) -> KVRecoveryH2DReceipt:
++    context = make_context()
++    resolved_transfer_id = transfer_id or f"{process_uuid}:t:0"
++    return KVRecoveryH2DReceipt(
++        binding=context.binding,
++        connector_job_id=7,
++        transfer_id=resolved_transfer_id,
++        identity=context.identity,
++        block_set_id=context.block_set_id,
++        process_uuid=process_uuid,
++        rank=0,
++        world_size=1,
++        clock_domain_id=CLOCK_DOMAIN_ID,
++        communication_done_event_id=f"{process_uuid}:e:8",
++        restore_done_profile_record_id=f"{process_uuid}:k:9",
++        timestamp_ns=10,
++        bytes_moved=128,
++    )
++
++
++def make_attempt_receipt(
++    attempt: KVRecoveryTransferAttempt,
++    timestamp_ns: int,
++    bytes_moved: int,
++    *,
++    clock_domain_id: str = CLOCK_DOMAIN_ID,
++) -> KVRecoveryH2DReceipt:
++    context = attempt.context
++    return KVRecoveryH2DReceipt(
++        binding=context.binding,
++        connector_job_id=attempt.connector_job_id,
++        transfer_id=attempt.transfer_id,
++        identity=context.identity,
++        block_set_id=context.block_set_id,
++        process_uuid=PROCESS_UUID,
++        rank=0,
++        world_size=1,
++        clock_domain_id=clock_domain_id,
++        communication_done_event_id=(f"{PROCESS_UUID}:e:{attempt.connector_job_id}"),
++        restore_done_profile_record_id=(f"{PROCESS_UUID}:k:{attempt.connector_job_id}"),
++        timestamp_ns=timestamp_ns,
++        bytes_moved=bytes_moved,
++    )
++
++
++class NoopEvidenceSink:
++    def __init__(self):
++        self.failures: list[str] = []
++        self.close_calls = 0
++
++    def transfer_submitted(self, attempt, timestamp_ns):
++        return None
++
++    def transfer_not_submitted(self, attempt):
++        return None
++
++    def transfer_completed(self, **kwargs):
++        return None
++
++    def pending_h2d_capacity_exhausted(self, attempt, timestamp_ns, loss_reason):
++        return None
++
++    def evidence_failure(
++        self,
++        reason,
++        connector_job_ids,
++        transfer_ids,
++        timestamp_ns,
++    ):
++        self.failures.append(reason)
++
++    def wait_completed(self, attempt):
++        return None
++
++    def h2d_receipt_truncated(self, receipt):
++        return None
++
++    def close(self, open_attempts, evidence_disabled):
++        self.close_calls += 1
++
++
++def test_binding_locks_authorized_candidate_digests():
++    binding = KV_RECOVERY_PROFILE_BINDING
++    assert binding.profile_sha256 == (
++        "b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"
++    )
++    assert binding.communication_mapping_candidate_sha256 == (
++        "dca914f989f3a98d43fb9fa2538f7c43a375e8f22f5deb7e09343aee5ee7bc19"
++    )
++    assert binding.base_mode_overlay_candidate_sha256 == (
++        "6e035c29664038cdc93b545538cee6fc31abfb79e455d994851f8c9dbfd1c734"
++    )
++    assert binding.communication_mapping_status == (
++        "candidate_issue2_authority_pending"
++    )
++    assert binding.base_mode_overlay_status == ("candidate_owner_ratification_pending")
++    assert binding.communication_mode == "none"
++    assert not binding.runtime_activation_authorized
++    assert not recovery_profile.KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
++    assert binding.runtime_commit == "f229ba7cad21a4dba58681af6738a9fd947388e2"
++    assert binding.device_plugin_audit_commit == (
++        "cafad89a5e103f31ea517c1edb56130578c3cd56"
++    )
++
++
++def test_recovery_abi_round_trips_through_pickle():
++    context = make_context()
++    attempt = KVRecoveryTransferAttempt(
++        connector_job_id=7,
++        transfer_id=f"{'a' * 32}:t:0",
++        context=context,
++    )
++
++    assert pickle.loads(pickle.dumps(context)) == context
++    assert pickle.loads(pickle.dumps(attempt)) == attempt
++
++
++def test_context_rejects_coordinate_or_digest_drift():
++    context = make_context()
++    reversed_blocks = tuple(reversed(context.logical_blocks))
++
++    with pytest.raises(ValueError, match="canonical coordinate order"):
++        KVRecoveryTransferContext(
++            binding=context.binding,
++            identity=context.identity,
++            operation=context.operation,
++            block_set_id=context.block_set_id,
++            logical_blocks=reversed_blocks,
++        )
++
++    with pytest.raises(ValueError, match="does not match"):
++        KVRecoveryTransferContext(
++            binding=context.binding,
++            identity=context.identity,
++            operation=context.operation,
++            block_set_id="0" * 64,
++            logical_blocks=context.logical_blocks,
++        )
++
++
++def test_h2d_requires_episode_and_d2h_forbids_episode():
++    h2d_context = make_context(operation="h2d_restore")
++    d2h_context = make_context(operation="d2h_preserve")
++
++    with pytest.raises(ValueError, match="H2D restore requires"):
++        KVRecoveryTransferContext(
++            binding=h2d_context.binding,
++            identity=d2h_context.identity,
++            operation="h2d_restore",
++            block_set_id=canonical_block_set_id(
++                h2d_context.binding,
++                d2h_context.identity,
++                h2d_context.logical_blocks,
++            ),
++            logical_blocks=h2d_context.logical_blocks,
++        )
++
++    with pytest.raises(ValueError, match="D2H preserve cannot"):
++        KVRecoveryTransferContext(
++            binding=d2h_context.binding,
++            identity=h2d_context.identity,
++            operation="d2h_preserve",
++            block_set_id=canonical_block_set_id(
++                d2h_context.binding,
++                h2d_context.identity,
++                d2h_context.logical_blocks,
++            ),
++            logical_blocks=d2h_context.logical_blocks,
++        )
++
++
++def test_default_path_has_no_observer_or_profiler_import(
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++):
++    class UnexpectedFactory:
++        def reinitialize_after_fork(self, binding):
++            raise AssertionError("hard-off factory was called")
++
++        def create_scheduler_observer(self, binding):
++            raise AssertionError("hard-off factory was called")
++
++        def create_worker_observer(self, binding):
++            raise AssertionError("hard-off factory was called")
++
++    forbidden_output = tmp_path / "must-not-exist.jsonl"
++    monkeypatch.setenv("VLLM_RLP_TRACE_EXPORT_PATH", str(forbidden_output))
++    monkeypatch.setenv("VLLM_RLP_KV_RECOVERY_PROFILE", "rlp.kv-recovery/v1alpha1")
++    register_kv_recovery_observer_factory(UnexpectedFactory())
++    assert recovery_profile._observer_factory is None
++    initial_threads = tuple(thread.ident for thread in threading.enumerate())
++
++    assert create_kv_recovery_scheduler_observer() is None
++    assert create_kv_recovery_worker_observer() is None
++    monkeypatch.setattr(
++        recovery_profile.os,
++        "getpid",
++        lambda: (_ for _ in ()).throw(
++            AssertionError("hard-off path queried fork state")
++        ),
++    )
++    prepare_kv_recovery_profile_after_fork()
++    reinitialize_kv_recovery_profile_after_fork()
++
++    assert not any(
++        module_name.startswith("vllm_request_lifecycle_profiler")
++        for module_name in sys.modules
++    )
++    assert tuple(thread.ident for thread in threading.enumerate()) == initial_threads
++    assert not forbidden_output.exists()
++
++
++def test_pending_authorities_keep_activation_gate_closed(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    monkeypatch.setattr(
++        recovery_profile, "KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED", True
++    )
++
++    assert not recovery_profile._activation_gate_open()
++
++
++def test_runtime_scope_requires_exact_tiering_spec_and_recompute_off(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    from vllm.v1.kv_offload.cpu.spec import CPUOffloadingSpec
++    from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
++
++    class CustomTieringSpec(TieringOffloadingSpec):
++        pass
++
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    tiering_spec = object.__new__(TieringOffloadingSpec)
++    recompute_off = SimpleNamespace(
++        additional_config={"recompute_scheduler_enable": False}
++    )
++
++    assert recovery_profile.kv_recovery_runtime_scope_authorized(
++        tiering_spec, recompute_off
++    )
++    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
++        object.__new__(CPUOffloadingSpec), recompute_off
++    )
++    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
++        object.__new__(CustomTieringSpec), recompute_off
++    )
++    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
++        tiering_spec, SimpleNamespace(additional_config={})
++    )
++    assert not recovery_profile.kv_recovery_runtime_scope_authorized(
++        tiering_spec,
++        SimpleNamespace(additional_config={"recompute_scheduler_enable": True}),
++    )
++
++
++def test_factory_failures_degrade_to_none(monkeypatch: pytest.MonkeyPatch):
++    class BrokenFactory:
++        def reinitialize_after_fork(self, binding):
++            raise RuntimeError("broken bootstrap")
++
++        def create_scheduler_observer(self, binding):
++            raise RuntimeError("broken scheduler")
++
++        def create_worker_observer(self, binding):
++            raise RuntimeError("broken worker")
++
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    factory = BrokenFactory()
++    register_kv_recovery_observer_factory(factory)
++
++    reinitialize_kv_recovery_profile_after_fork()
++    assert recovery_profile._observer_factory is None
++    assert create_kv_recovery_scheduler_observer() is None
++    assert create_kv_recovery_worker_observer() is None
++
++
++def test_factory_registration_rejects_replacement(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    class Factory:
++        def reinitialize_after_fork(self, binding):
++            return None
++
++        def create_scheduler_observer(self, binding):
++            return None
++
++        def create_worker_observer(self, binding):
++            return None
++
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    first = Factory()
++    register_kv_recovery_observer_factory(first)
++    register_kv_recovery_observer_factory(first)
++
++    with pytest.raises(RuntimeError, match="already registered"):
++        register_kv_recovery_observer_factory(Factory())
++
++
++def test_first_create_after_fork_reinitializes_factory_once(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    scheduler_observer = object()
++
++    class Factory:
++        def __init__(self):
++            self.reinitialize_calls = 0
++
++        def reinitialize_after_fork(self, binding):
++            self.reinitialize_calls += 1
++
++        def create_scheduler_observer(self, binding):
++            return scheduler_observer
++
++        def create_worker_observer(self, binding):
++            return None
++
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    factory = Factory()
++    register_kv_recovery_observer_factory(factory)
++    monkeypatch.setattr(recovery_profile, "_observer_factory_pid", -1)
++    monkeypatch.setattr(recovery_profile, "_observer_factory_ready_pid", -1)
++
++    assert create_kv_recovery_scheduler_observer() is scheduler_observer
++    assert create_kv_recovery_worker_observer() is None
++    assert factory.reinitialize_calls == 1
++
++
++def test_child_registration_can_replace_inherited_factory(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    class Factory:
++        def __init__(self, scheduler_observer):
++            self.scheduler_observer = scheduler_observer
++
++        def reinitialize_after_fork(self, binding):
++            raise AssertionError("fresh child factory must not be reinitialized")
++
++        def create_scheduler_observer(self, binding):
++            return self.scheduler_observer
++
++        def create_worker_observer(self, binding):
++            return None
++
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    parent_factory = Factory(object())
++    register_kv_recovery_observer_factory(parent_factory)
++    monkeypatch.setattr(recovery_profile, "_observer_factory_pid", -1)
++    monkeypatch.setattr(recovery_profile, "_observer_factory_ready_pid", -1)
++    child_scheduler_observer = object()
++    child_factory = Factory(child_scheduler_observer)
++
++    register_kv_recovery_observer_factory(child_factory)
++
++    assert recovery_profile._observer_factory is child_factory
++    assert create_kv_recovery_scheduler_observer() is child_scheduler_observer
++
++
++def test_coordinate_rejects_negative_values():
++    with pytest.raises(ValueError, match="uint32"):
++        KVRecoveryBlockCoordinate(-1, 0)
++
++
++def test_all_abi_uint_fields_reject_bool_and_float_values():
++    for value in (False, 0.0):
++        with pytest.raises(ValueError, match="uint32"):
++            KVRecoveryBlockCoordinate(value, 0)  # type: ignore[arg-type]
++        with pytest.raises(ValueError, match="ordinal"):
++            KVRecoveryBlockCoordinate(0, value)  # type: ignore[arg-type]
++
++    identity = make_identity()
++    lifecycle_id = identity.engine_lifecycle_id
++    for value in (True, 1.0):
++        with pytest.raises(ValueError, match="recovery_epoch"):
++            replace(
++                identity,
++                recovery_epoch=value,  # type: ignore[arg-type]
++                episode_id=f"{lifecycle_id}:k:{value}",
++            )
++
++    context = make_context()
++    for value in (False, 7.0):
++        with pytest.raises(ValueError, match="connector_job_id"):
++            KVRecoveryTransferAttempt(
++                connector_job_id=value,  # type: ignore[arg-type]
++                transfer_id=f"{PROCESS_UUID}:t:0",
++                context=context,
++            )
++
++    receipt = make_receipt()
++    for field_name, value, message in (
++        ("connector_job_id", 7.0, "connector_job_id"),
++        ("rank", False, "rank=0"),
++        ("world_size", True, "rank=0"),
++        ("timestamp_ns", 10.0, "timestamp/bytes"),
++        ("bytes_moved", 128.0, "timestamp/bytes"),
++    ):
++        with pytest.raises(ValueError, match=message):
++            replace(receipt, **{field_name: value})
++
++    for value in (False, 10.0):
++        with pytest.raises(ValueError, match="wait-entry"):
++            KVRecoveryWaitAttempt(
++                recovery_profile.KVRecoveryWaitMembership((f"{PROCESS_UUID}:t:0",)),
++                value,  # type: ignore[arg-type]
++            )
++
++
++def test_identity_and_scoped_ids_reject_noncanonical_values():
++    identity = make_identity()
++
++    with pytest.raises(ValueError, match="run_id"):
++        replace(identity, run_id="run-0")
++    with pytest.raises(ValueError, match="base_preempted_event_id"):
++        replace(identity, base_preempted_event_id="preempted-0")
++    with pytest.raises(ValueError, match="transfer_id"):
++        KVRecoveryTransferAttempt(
++            connector_job_id=7,
++            transfer_id=f"{'a' * 32}:t:{2**64}",
++            context=make_context(),
++        )
++
++    receipt = make_receipt()
++    with pytest.raises(ValueError, match="belong to process_uuid"):
++        replace(receipt, transfer_id=f"{'b' * 32}:t:0")
++    with pytest.raises(ValueError, match="rank=0"):
++        replace(receipt, rank=1, world_size=2)
++    with pytest.raises(ValueError, match="communication_done_event_id"):
++        replace(receipt, communication_done_event_id=f"{'b' * 32}:e:8")
++    with pytest.raises(ValueError, match="restore_done_profile_record_id"):
++        replace(receipt, restore_done_profile_record_id=f"{'a' * 32}:k:{2**64}")
++
++
++def test_transfer_seq_uses_last_uint64_then_saturates_without_wrap():
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    observer._transfer_seq = 2**64 - 1
++
++    last = observer.begin_transfer(7, make_context())
++    assert last is not None
++    assert last.transfer_id == f"{'a' * 32}:t:{2**64 - 1}"
++    observer.transfer_not_submitted(last)
++
++    assert observer.begin_transfer(8, make_context()) is None
++    assert observer.transfer_seq == 2**64
++    assert observer.evidence_disabled
++    assert sink.failures == ["transfer_seq_exhausted"]
++
++    assert observer.begin_transfer(9, make_context()) is None
++    assert observer.transfer_seq == 2**64
++    assert sink.failures == ["transfer_seq_exhausted"]
++
++
++def test_bounded_observer_close_is_idempotent_and_terminal():
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context())
++    assert attempt is not None
++
++    observer.close()
++    observer.close()
++
++    assert sink.close_calls == 1
++    assert observer.pending_h2d_count == 0
++    assert observer.begin_transfer(8, make_context()) is None
++    observer.transfer_not_submitted(attempt)
++    assert sink.close_calls == 1
++    assert sink.failures == []
++
++
++def test_close_racing_begin_cannot_leave_a_new_attempt():
++    close_entered = threading.Event()
++    close_release = threading.Event()
++
++    class BlockingCloseSink(NoopEvidenceSink):
++        def close(self, open_attempts, evidence_disabled):
++            close_entered.set()
++            assert close_release.wait(timeout=3)
++            super().close(open_attempts, evidence_disabled)
++
++    sink = BlockingCloseSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    results: list[KVRecoveryTransferAttempt | None] = []
++    close_thread = threading.Thread(target=observer.close)
++    close_thread.start()
++    assert close_entered.wait(timeout=3)
++
++    begin_thread = threading.Thread(
++        target=lambda: results.append(observer.begin_transfer(7, make_context()))
++    )
++    begin_thread.start()
++    close_release.set()
++    close_thread.join(timeout=3)
++    begin_thread.join(timeout=3)
++
++    assert not close_thread.is_alive()
++    assert not begin_thread.is_alive()
++    assert results == [None]
++    assert observer.pending_h2d_count == 0
++    assert sink.close_calls == 1
++
++
++def test_bounded_observer_rejects_sink_receipt_for_another_transfer():
++    class InvalidReceiptSink(NoopEvidenceSink):
++        def transfer_completed(
++            self,
++            attempt,
++            submit_timestamp_ns,
++            timestamp_ns,
++            success,
++            bytes_moved,
++            device_duration_ns,
++        ):
++            context = attempt.context
++            return KVRecoveryH2DReceipt(
++                binding=context.binding,
++                connector_job_id=attempt.connector_job_id,
++                transfer_id=f"{'a' * 32}:t:999",
++                identity=context.identity,
++                block_set_id=context.block_set_id,
++                process_uuid="a" * 32,
++                rank=0,
++                world_size=1,
++                clock_domain_id=CLOCK_DOMAIN_ID,
++                communication_done_event_id=f"{'a' * 32}:e:8",
++                restore_done_profile_record_id=f"{'a' * 32}:k:9",
++                timestamp_ns=timestamp_ns,
++                bytes_moved=bytes_moved,
++            )
++
++    sink = InvalidReceiptSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context())
++    assert attempt is not None
++    observer.transfer_submitted(attempt, 10)
++
++    receipt = observer.transfer_completed(7, 20, True, 128, 5)
++
++    assert receipt is None
++    assert sink.failures == ["invalid_h2d_receipt"]
++
++
++def test_bounded_observer_rejects_foreign_clock_receipt():
++    class ForeignClockSink(NoopEvidenceSink):
++        def transfer_completed(
++            self,
++            attempt,
++            submit_timestamp_ns,
++            timestamp_ns,
++            success,
++            bytes_moved,
++            device_duration_ns,
++        ):
++            return make_attempt_receipt(
++                attempt,
++                timestamp_ns,
++                bytes_moved,
++                clock_domain_id="d" * 32,
++            )
++
++    sink = ForeignClockSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context())
++    assert attempt is not None
++    observer.transfer_submitted(attempt, 10)
++
++    assert observer.transfer_completed(7, 20, True, 128, 5) is None
++    assert sink.failures == ["invalid_h2d_receipt"]
++
++
++def test_foreign_run_transfer_cannot_enter_wait_membership():
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    local_context = make_context(operation="d2h_preserve")
++    local_attempt = observer.begin_transfer(7, local_context)
++    assert local_attempt is not None
++    observer.transfer_submitted(local_attempt, 10)
++
++    foreign_identity = replace(local_context.identity, run_id="f" * 32)
++    foreign_context = replace(
++        local_context,
++        identity=foreign_identity,
++        block_set_id=canonical_block_set_id(
++            local_context.binding,
++            foreign_identity,
++            local_context.logical_blocks,
++        ),
++    )
++    assert observer.begin_transfer(8, foreign_context) is None
++    assert observer.prepare_wait(frozenset({7, 8})) is None
++    assert sink.failures == ["foreign_run_transfer", "invalid_wait_membership"]
++
++
++@pytest.mark.parametrize(
++    ("connector_job_id", "timestamp_ns", "success", "bytes_moved", "duration_ns"),
++    [
++        (7.0, 20, True, 128, 5),
++        (7, 20.0, True, 128, 5),
++        (7, 20, 1, 128, 5),
++        (7, 20, True, 128.0, 5),
++        (7, 20, True, 128, 5.0),
++    ],
++)
++def test_completion_rejects_non_exact_integer_inputs_without_consuming_attempt(
++    connector_job_id,
++    timestamp_ns,
++    success,
++    bytes_moved,
++    duration_ns,
++):
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context())
++    assert attempt is not None
++    observer.transfer_submitted(attempt, 10)
++
++    assert (
++        observer.transfer_completed(
++            connector_job_id,
++            timestamp_ns,
++            success,
++            bytes_moved,
++            duration_ns,
++        )
++        is None
++    )
++    assert observer.prepare_wait(frozenset({7})) is not None
++    assert sink.failures == ["invalid_completion_measurement"]
++
++
++def test_equal_h2d_timestamps_reach_profile_sink_but_cannot_emit_receipt():
++    class RecordingReceiptSink(NoopEvidenceSink):
++        def __init__(self):
++            super().__init__()
++            self.completion_calls = 0
++
++        def transfer_completed(
++            self,
++            attempt,
++            submit_timestamp_ns,
++            timestamp_ns,
++            success,
++            bytes_moved,
++            device_duration_ns,
++        ):
++            self.completion_calls += 1
++            return make_attempt_receipt(attempt, timestamp_ns, bytes_moved)
++
++    sink = RecordingReceiptSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context())
++    assert attempt is not None
++    observer.transfer_submitted(attempt, 10)
++
++    assert observer.transfer_completed(7, 10, True, 128, 5) is None
++    assert sink.completion_calls == 1
++    assert sink.failures == ["invalid_h2d_receipt"]
++
++
++def test_equal_d2h_timestamps_fail_before_profile_completion():
++    class RecordingCompletionSink(NoopEvidenceSink):
++        def __init__(self):
++            super().__init__()
++            self.completion_calls = 0
++
++        def transfer_completed(self, **kwargs):
++            self.completion_calls += 1
++            return None
++
++    sink = RecordingCompletionSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++    attempt = observer.begin_transfer(7, make_context(operation="d2h_preserve"))
++    assert attempt is not None
++    observer.transfer_submitted(attempt, 10)
++
++    assert observer.transfer_completed(7, 10, True, 128, 5) is None
++    assert sink.completion_calls == 0
++    assert sink.failures == ["invalid_completion_measurement"]
++
++
++def test_overbound_wait_is_rejected_before_membership_resolution():
++    sink = NoopEvidenceSink()
++    observer = BoundedKVRecoveryWorkerObserver(
++        PROCESS_UUID, RUN_ID, CLOCK_DOMAIN_ID, sink
++    )
++
++    membership = observer.prepare_wait(frozenset(range(4097)))
++
++    assert membership is None
++    assert sink.failures == ["invalid_wait_membership"]
++
++
++@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
++def test_prepare_after_fork_replaces_inherited_factory_lock(
++    monkeypatch: pytest.MonkeyPatch,
++):
++    class Factory:
++        def reinitialize_after_fork(self, binding):
++            return None
++
++        def create_scheduler_observer(self, binding):
++            return None
++
++        def create_worker_observer(self, binding):
++            return None
++
++    monkeypatch.setattr(recovery_profile, "_activation_gate_open", lambda: True)
++    read_fd, write_fd = os.pipe()
++    inherited_lock = recovery_profile._observer_factory_lock
++    inherited_lock.acquire()
++    child_pid = os.fork()
++    if child_pid == 0:
++        os.close(read_fd)
++        try:
++            prepare_kv_recovery_profile_after_fork()
++            register_kv_recovery_observer_factory(Factory())
++            os.write(write_fd, b"ok")
++        except BaseException as exc:
++            os.write(write_fd, f"error:{exc!r}".encode())
++        finally:
++            os.close(write_fd)
++            os._exit(0)
++
++    os.close(write_fd)
++    inherited_lock.release()
++    ready, _, _ = select.select([read_fd], [], [], 3.0)
++    if not ready:
++        os.kill(child_pid, signal.SIGKILL)
++        os.waitpid(child_pid, 0)
++        pytest.fail("fork child deadlocked on inherited factory lock")
++    result = os.read(read_fd, 1024)
++    os.close(read_fd)
++    _, status = os.waitpid(child_pid, 0)
++
++    assert os.waitstatus_to_exitcode(status) == 0
++    assert result == b"ok"
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+index 939a2b08ff..ae91bd36a9 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/common.py
+@@ -7,6 +7,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+     KVConnectorWorkerMetadata,
+ )
+ from vllm.v1.kv_offload.base import LoadStoreSpec
++from vllm.v1.kv_recovery_profile import (
++    MAX_H2D_RECEIPTS_PER_WORKER_STEP,
++    KVRecoveryH2DReceipt,
++    KVRecoveryTransferContext,
++)
+ 
+ ReqId = str
+ 
+@@ -70,6 +75,7 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
+     load_jobs: dict[int, TransferJob]
+     store_jobs: dict[int, TransferJob]
+     jobs_to_flush: set[int] | None = None
++    kv_recovery_contexts: dict[int, KVRecoveryTransferContext] | None = None
+ 
+ 
+ @dataclass
+@@ -84,11 +90,24 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+ 
+     completed_jobs: dict[int, int] = field(default_factory=dict)
+     transfer_stats: TransferStats = field(default_factory=TransferStats)
++    kv_recovery_h2d_receipts: tuple[KVRecoveryH2DReceipt, ...] = ()
++    kv_recovery_h2d_receipts_truncated: bool = False
+ 
+     def mark_completed(self, job_id: int) -> None:
+         """Record a transfer job completion from this worker."""
+         self.completed_jobs[job_id] = 1
+ 
++    def add_kv_recovery_h2d_receipt(self, receipt: KVRecoveryH2DReceipt) -> bool:
++        """Append a bounded evidence receipt without affecting completion."""
++        if len(self.kv_recovery_h2d_receipts) >= (MAX_H2D_RECEIPTS_PER_WORKER_STEP):
++            self.kv_recovery_h2d_receipts_truncated = True
++            return False
++        self.kv_recovery_h2d_receipts = (
++            *self.kv_recovery_h2d_receipts,
++            receipt,
++        )
++        return True
++
+     def aggregate(
+         self, other: "KVConnectorWorkerMetadata"
+     ) -> "KVConnectorWorkerMetadata":
+@@ -98,7 +117,31 @@ class OffloadingWorkerMetadata(KVConnectorWorkerMetadata):
+         for job_id, v in other.completed_jobs.items():
+             merged[job_id] = merged.get(job_id, 0) + v
+ 
++        if (
++            not self.kv_recovery_h2d_receipts
++            and not other.kv_recovery_h2d_receipts
++            and not self.kv_recovery_h2d_receipts_truncated
++            and not other.kv_recovery_h2d_receipts_truncated
++        ):
++            return OffloadingWorkerMetadata(
++                completed_jobs=merged,
++                transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
++            )
++
++        left_receipts = self.kv_recovery_h2d_receipts[:MAX_H2D_RECEIPTS_PER_WORKER_STEP]
++        remaining_capacity = MAX_H2D_RECEIPTS_PER_WORKER_STEP - len(left_receipts)
++        right_receipts = other.kv_recovery_h2d_receipts[:remaining_capacity]
++        combined_receipts = left_receipts + right_receipts
++        receipts_truncated = (
++            self.kv_recovery_h2d_receipts_truncated
++            or other.kv_recovery_h2d_receipts_truncated
++            or len(self.kv_recovery_h2d_receipts) > len(left_receipts)
++            or len(other.kv_recovery_h2d_receipts) > len(right_receipts)
++        )
++
+         return OffloadingWorkerMetadata(
+             completed_jobs=merged,
+             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
++            kv_recovery_h2d_receipts=combined_receipts,
++            kv_recovery_h2d_receipts_truncated=receipts_truncated,
+         )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+index 33d24a8702..53c44e5faa 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/scheduler.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ from collections.abc import Iterable, Sequence
++from contextlib import suppress
+ from dataclasses import dataclass, field
+ from itertools import islice
+ from typing import Any, NamedTuple
+@@ -45,6 +46,14 @@ from vllm.v1.kv_offload.base import (
+     ScheduleEndContext,
+     make_offload_key,
+ )
++from vllm.v1.kv_recovery_profile import (
++    MAX_LOGICAL_BLOCKS_PER_SET,
++    KVRecoveryBlockCoordinate,
++    KVRecoveryH2DReceipt,
++    KVRecoveryOperation,
++    KVRecoverySchedulerObserver,
++    KVRecoveryTransferContext,
++)
+ from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request
+ 
+@@ -339,9 +348,11 @@ class OffloadingConnectorScheduler:
+     def __init__(
+         self,
+         spec: OffloadingSpec,
++        kv_recovery_observer: KVRecoverySchedulerObserver | None = None,
+     ):
+         self.config = SchedulerOffloadConfig.from_spec(spec)
+         self.manager: OffloadingManager = spec.get_manager()
++        self._kv_recovery_observer = kv_recovery_observer
+         self._connector_stats: OffloadingConnectorStats | None = None
+         self._reclaimable_block_ids: set[int] = set()
+ 
+@@ -368,6 +379,9 @@ class OffloadingConnectorScheduler:
+ 
+         self._req_status: dict[ReqId, RequestOffloadState] = {}
+         self._current_batch_load_jobs: dict[int, TransferJob] = {}
++        self._current_batch_kv_recovery_contexts: (
++            dict[int, KVRecoveryTransferContext] | None
++        ) = {} if kv_recovery_observer is not None else None
+         self._current_batch_jobs_to_flush: set[int] = set()
+         # GPU block IDs allocated in the current engine step
+         self._current_batch_allocated_block_ids: set[int] = set()
+@@ -393,6 +407,47 @@ class OffloadingConnectorScheduler:
+ 
+         self._events_tracker = OffloadingEventsTracker(spec.kv_events_config)
+ 
++    def _prepare_kv_recovery_context(
++        self,
++        req_id: str,
++        operation: KVRecoveryOperation,
++        coordinates: list[KVRecoveryBlockCoordinate] | None,
++    ) -> KVRecoveryTransferContext | None:
++        observer = self._kv_recovery_observer
++        if observer is None or not coordinates:
++            return None
++        canonical_coordinates = tuple(sorted(coordinates))
++        try:
++            context = observer.prepare_transfer_context(
++                req_id, operation, canonical_coordinates
++            )
++            if not isinstance(context, KVRecoveryTransferContext):
++                return None
++            if (
++                context.operation != operation
++                or context.identity.runtime_request_id != req_id
++                or context.coordinates != canonical_coordinates
++            ):
++                return None
++            return context
++        except Exception:
++            return None
++
++    @staticmethod
++    def _append_kv_recovery_coordinate(
++        coordinates: list[KVRecoveryBlockCoordinate] | None,
++        group_index: int,
++        logical_ordinal: int,
++    ) -> None:
++        if coordinates is None or len(coordinates) > MAX_LOGICAL_BLOCKS_PER_SET:
++            return
++        coordinates.append(
++            KVRecoveryBlockCoordinate(
++                group_index=group_index,
++                logical_ordinal=logical_ordinal,
++            )
++        )
++
+     def _generate_job_id(self) -> int:
+         job_id = self._job_counter
+         self._job_counter += 1
+@@ -726,6 +781,9 @@ class OffloadingConnectorScheduler:
+         # per group
+         group_sizes: list[int] = []
+         block_indices: list[int] = []
++        kv_recovery_coordinates: list[KVRecoveryBlockCoordinate] | None = (
++            [] if self._kv_recovery_observer is not None else None
++        )
+         for group_config, group_state, group_blocks in zip(
+             self.config.kv_group_configs,
+             req_status.group_states,
+@@ -768,6 +826,20 @@ class OffloadingConnectorScheduler:
+                     num_locally_computed_gpu_blocks // self.config.block_size_factor
+                 )
+                 keys_to_load.extend(offload_keys[start_block_idx:num_blocks])
++                if kv_recovery_coordinates is not None:
++                    remaining_capacity = (
++                        MAX_LOGICAL_BLOCKS_PER_SET + 1 - len(kv_recovery_coordinates)
++                    )
++                    capture_stop = min(
++                        num_blocks,
++                        start_block_idx + max(0, remaining_capacity),
++                    )
++                    for logical_ordinal in range(start_block_idx, capture_stop):
++                        self._append_kv_recovery_coordinate(
++                            kv_recovery_coordinates,
++                            group_config.group_idx,
++                            logical_ordinal,
++                        )
+ 
+             dst_block_ids.extend(
+                 block.block_id
+@@ -790,6 +862,14 @@ class OffloadingConnectorScheduler:
+         )
+ 
+         load_job_id = self._generate_job_id()
++        kv_recovery_context = self._prepare_kv_recovery_context(
++            request.request_id,
++            "h2d_restore",
++            kv_recovery_coordinates,
++        )
++        if kv_recovery_context is not None:
++            assert self._current_batch_kv_recovery_contexts is not None
++            self._current_batch_kv_recovery_contexts[load_job_id] = kv_recovery_context
+         self._current_batch_load_jobs[load_job_id] = TransferJob(
+             req_id=request.request_id,
+             src_spec=src_spec,
+@@ -1003,6 +1083,9 @@ class OffloadingConnectorScheduler:
+             src_block_ids: list[int] = []
+             sliding_window_block_ids: list[int] = []
+             non_sliding_window_block_ids: list[int] = []
++            kv_recovery_coordinates: list[KVRecoveryBlockCoordinate] | None = (
++                [] if self._kv_recovery_observer is not None else None
++            )
+             for group_idx, (group_config, group_state) in enumerate(
+                 zip(self.config.kv_group_configs, req_status.group_states)
+             ):
+@@ -1021,6 +1104,15 @@ class OffloadingConnectorScheduler:
+                         continue
+ 
+                     offloaded_block_idx = start_block_idx + idx
++                    if (
++                        kv_recovery_coordinates is not None
++                        and len(kv_recovery_coordinates) <= MAX_LOGICAL_BLOCKS_PER_SET
++                    ):
++                        self._append_kv_recovery_coordinate(
++                            kv_recovery_coordinates,
++                            group_config.group_idx,
++                            offloaded_block_idx,
++                        )
+ 
+                     self._events_tracker.record_store(
+                         req, group_config, offloaded_block_idx, offload_key
+@@ -1075,8 +1167,18 @@ class OffloadingConnectorScheduler:
+                 ),
+             )
+ 
++            kv_recovery_context = self._prepare_kv_recovery_context(
++                req_id,
++                "d2h_preserve",
++                kv_recovery_coordinates,
++            )
++            if kv_recovery_context is not None:
++                assert self._current_batch_kv_recovery_contexts is not None
++                self._current_batch_kv_recovery_contexts[job_id] = kv_recovery_context
+             store_jobs[job_id] = TransferJob(
+-                req_id=req_id, src_spec=src_spec, dst_spec=dst_spec
++                req_id=req_id,
++                src_spec=src_spec,
++                dst_spec=dst_spec,
+             )
+ 
+             logger.debug(
+@@ -1126,12 +1228,17 @@ class OffloadingConnectorScheduler:
+                 for jid in self._block_id_to_pending_jobs[bid]
+             )
+ 
++        store_jobs = self._build_store_jobs(scheduler_output)
+         meta = OffloadingConnectorMetadata(
+             load_jobs=self._current_batch_load_jobs,
+-            store_jobs=self._build_store_jobs(scheduler_output),
++            store_jobs=store_jobs,
+             jobs_to_flush=self._current_batch_jobs_to_flush,
++            kv_recovery_contexts=self._current_batch_kv_recovery_contexts,
+         )
+         self._current_batch_load_jobs = {}
++        self._current_batch_kv_recovery_contexts = (
++            {} if self._kv_recovery_observer is not None else None
++        )
+         self._current_batch_jobs_to_flush = set()
+         self._current_batch_allocated_block_ids = set()
+         return meta
+@@ -1189,6 +1296,19 @@ class OffloadingConnectorScheduler:
+             else:
+                 self._connector_stats.aggregate(transfer_stats)
+ 
++        observer = self._kv_recovery_observer
++        eligible_h2d_receipt_job_ids = (
++            {
++                job_id
++                for job_id in meta.completed_jobs
++                if job_id >= self._stale_job_threshold
++                and (job_status := self._jobs.get(job_id)) is not None
++                and not job_status.is_store
++            }
++            if observer is not None
++            else None
++        )
++
+         for job_id, count in meta.completed_jobs.items():
+             assert count > 0
+             if job_id < self._stale_job_threshold:
+@@ -1234,6 +1354,33 @@ class OffloadingConnectorScheduler:
+             if not req_status.transfer_jobs and req_status.req.is_finished():
+                 del self._req_status[job_status.req_id]
+ 
++        if observer is not None and (
++            meta.kv_recovery_h2d_receipts or meta.kv_recovery_h2d_receipts_truncated
++        ):
++            assert eligible_h2d_receipt_job_ids is not None
++            fresh_receipts: list[KVRecoveryH2DReceipt] = []
++            receipts_incomplete = meta.kv_recovery_h2d_receipts_truncated
++            for receipt in meta.kv_recovery_h2d_receipts:
++                try:
++                    if not isinstance(receipt, KVRecoveryH2DReceipt):
++                        receipts_incomplete = True
++                    elif receipt.connector_job_id < self._stale_job_threshold:
++                        continue
++                    elif receipt.connector_job_id in eligible_h2d_receipt_job_ids:
++                        fresh_receipts.append(receipt)
++                    else:
++                        receipts_incomplete = True
++                except Exception:
++                    receipts_incomplete = True
++            try:
++                if fresh_receipts or receipts_incomplete:
++                    observer.consume_h2d_receipts(
++                        tuple(fresh_receipts),
++                        receipts_incomplete,
++                    )
++            except Exception:
++                pass
++
+     def take_reclaimable_block_ids(self) -> set[int]:
+         block_ids = self._reclaimable_block_ids
+         self._reclaimable_block_ids = set()
+@@ -1314,6 +1461,7 @@ class OffloadingConnectorScheduler:
+ 
+         # reset_cache cannot be called in the middle of a schedule step
+         assert not self._current_batch_load_jobs
++        assert not self._current_batch_kv_recovery_contexts
+         assert not self._current_batch_jobs_to_flush
+         assert not self._current_batch_allocated_block_ids
+ 
+@@ -1337,6 +1485,11 @@ class OffloadingConnectorScheduler:
+         self._jobs.clear()
+         self._block_id_to_pending_jobs.clear()
+ 
++        observer = self._kv_recovery_observer
++        if observer is not None:
++            with suppress(Exception):
++                observer.reset(self._stale_job_threshold)
++
+         # The manager pool is empty; pending event payloads and announced
+         # reference counts are stale.
+         self._events_tracker.reset()
+@@ -1347,4 +1500,10 @@ class OffloadingConnectorScheduler:
+             self._blocks_being_loaded.clear()
+ 
+     def shutdown(self) -> None:
+-        self.manager.shutdown()
++        try:
++            self.manager.shutdown()
++        finally:
++            observer = self._kv_recovery_observer
++            if observer is not None:
++                with suppress(Exception):
++                    observer.close()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+index 01c10f1b07..35c008bcce 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading/worker.py
+@@ -1,7 +1,11 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import math
++import time
+ from collections import defaultdict
++from contextlib import suppress
+ from dataclasses import replace
++from itertools import islice
+ 
+ import torch
+ 
+@@ -26,6 +30,15 @@ from vllm.v1.kv_offload.base import (
+     OffloadingSpec,
+     OffloadingWorker,
+ )
++from vllm.v1.kv_recovery_profile import (
++    MAX_TRANSFER_IDS_PER_WAIT_SET,
++    KVRecoveryH2DReceipt,
++    KVRecoveryTransferAttempt,
++    KVRecoveryTransferContext,
++    KVRecoveryWaitAttempt,
++    KVRecoveryWaitMembership,
++    KVRecoveryWorkerObserver,
++)
+ 
+ logger = init_logger(__name__)
+ 
+@@ -57,17 +70,202 @@ def _page_size_from_tensor(tensor: torch.Tensor, num_blocks: int) -> int:
+ class OffloadingConnectorWorker:
+     """Implementation of Worker side methods"""
+ 
+-    def __init__(self, spec: OffloadingSpec):
++    def __init__(
++        self,
++        spec: OffloadingSpec,
++        kv_recovery_observer: KVRecoveryWorkerObserver | None = None,
++    ):
+         self.spec = spec
+         self.worker: OffloadingWorker | None = None
++        self._kv_recovery_observer = kv_recovery_observer
+ 
+-        # job_id -> req_id for in-flight loads.
++        # Preserve the original profiler-off state shapes. Optional identity
++        # uses separate tables allocated only when an observer is active.
+         self._load_jobs: dict[int, ReqId] = {}
+         self._unsubmitted_store_jobs: list[
+             tuple[int, GPULoadStoreSpec, LoadStoreSpec]
+         ] = []
++        self._kv_recovery_store_contexts: (
++            dict[int, KVRecoveryTransferContext] | None
++        ) = {} if kv_recovery_observer is not None else None
++        self._kv_recovery_profiled_attempts: (
++            dict[int, KVRecoveryTransferAttempt] | None
++        ) = {} if kv_recovery_observer is not None else None
+         self._connector_worker_meta = OffloadingWorkerMetadata()
+ 
++    def _begin_kv_recovery_transfer(
++        self,
++        job_id: int,
++        context: KVRecoveryTransferContext | None,
++    ) -> KVRecoveryTransferAttempt | None:
++        observer = self._kv_recovery_observer
++        if observer is None or context is None:
++            return None
++        try:
++            attempt = observer.begin_transfer(job_id, context)
++            if not isinstance(attempt, KVRecoveryTransferAttempt):
++                return None
++            if attempt.connector_job_id != job_id or attempt.context != context:
++                return None
++            return attempt
++        except Exception:
++            return None
++
++    def _record_kv_recovery_submit(
++        self,
++        attempt: KVRecoveryTransferAttempt | None,
++        timestamp_ns: int,
++    ) -> bool:
++        observer = self._kv_recovery_observer
++        if observer is None or attempt is None:
++            return False
++        try:
++            observer.transfer_submitted(attempt, timestamp_ns)
++        except Exception:
++            return False
++        return True
++
++    def _record_kv_recovery_not_submitted(
++        self,
++        attempt: KVRecoveryTransferAttempt | None,
++    ) -> None:
++        observer = self._kv_recovery_observer
++        if observer is None or attempt is None:
++            return
++        try:
++            observer.transfer_not_submitted(attempt)
++        except Exception:
++            return
++
++    def _submit_pending_stores(self) -> None:
++        assert self.worker is not None
++        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
++            context = (
++                self._kv_recovery_store_contexts.pop(job_id, None)
++                if self._kv_recovery_store_contexts is not None
++                else None
++            )
++            attempt = self._begin_kv_recovery_transfer(job_id, context)
++            try:
++                success = self.worker.submit_store(job_id, src_spec, dst_spec)
++            except Exception:
++                self._record_kv_recovery_not_submitted(attempt)
++                raise
++            if not success:
++                self._record_kv_recovery_not_submitted(attempt)
++            assert success
++            if attempt is not None:
++                timestamp_ns = self._profile_clock_ns()
++                if timestamp_ns is not None and self._record_kv_recovery_submit(
++                    attempt, timestamp_ns
++                ):
++                    assert self._kv_recovery_profiled_attempts is not None
++                    self._kv_recovery_profiled_attempts[job_id] = attempt
++        self._unsubmitted_store_jobs.clear()
++
++    def _prepare_kv_recovery_wait(
++        self, job_ids: set[int]
++    ) -> KVRecoveryWaitMembership | None:
++        observer = self._kv_recovery_observer
++        if observer is None or not job_ids:
++            return None
++        try:
++            observed_job_ids = frozenset(
++                job_ids
++                if len(job_ids) <= MAX_TRANSFER_IDS_PER_WAIT_SET
++                else islice(job_ids, MAX_TRANSFER_IDS_PER_WAIT_SET + 1)
++            )
++            membership = observer.prepare_wait(observed_job_ids)
++            return (
++                membership if isinstance(membership, KVRecoveryWaitMembership) else None
++            )
++        except Exception:
++            return None
++
++    def _record_kv_recovery_wait(
++        self,
++        membership: KVRecoveryWaitMembership,
++        entry_timestamp_ns: int,
++    ) -> None:
++        observer = self._kv_recovery_observer
++        if observer is None:
++            return
++        try:
++            observer.wait_completed(
++                KVRecoveryWaitAttempt(
++                    membership,
++                    entry_timestamp_ns,
++                )
++            )
++        except Exception:
++            return
++
++    @staticmethod
++    def _profile_clock_ns() -> int | None:
++        try:
++            return time.monotonic_ns()
++        except Exception:
++            return None
++
++    @staticmethod
++    def _device_duration_ns(transfer_time: float | None) -> int | None:
++        if (
++            transfer_time is None
++            or type(transfer_time) not in (int, float)
++            or not math.isfinite(transfer_time)
++        ):
++            return None
++        if transfer_time <= 0 or transfer_time > ((2**64 - 1) / 1_000_000_000):
++            return None
++        try:
++            duration_ns = math.floor(transfer_time * 1_000_000_000 + 0.5)
++        except OverflowError:
++            return None
++        return duration_ns if duration_ns <= 2**64 - 1 else None
++
++    def _record_kv_recovery_completion(
++        self,
++        job_id: int,
++        timestamp_ns: int,
++        success: bool,
++        bytes_moved: int | None,
++        transfer_time: float | None,
++        attempt: KVRecoveryTransferAttempt,
++    ) -> None:
++        observer = self._kv_recovery_observer
++        if observer is None:
++            return
++        try:
++            receipt = observer.transfer_completed(
++                connector_job_id=job_id,
++                timestamp_ns=timestamp_ns,
++                success=success,
++                bytes_moved=bytes_moved,
++                device_duration_ns=self._device_duration_ns(transfer_time),
++            )
++            if receipt is None or not isinstance(receipt, KVRecoveryH2DReceipt):
++                return
++            context = attempt.context
++            if (
++                context.operation != "h2d_restore"
++                or receipt.connector_job_id != job_id
++                or receipt.transfer_id != attempt.transfer_id
++                or receipt.binding != context.binding
++                or receipt.identity != context.identity
++                or receipt.block_set_id != context.block_set_id
++                or receipt.timestamp_ns != timestamp_ns
++                or receipt.bytes_moved != bytes_moved
++            ):
++                return
++        except Exception:
++            return
++        if self._connector_worker_meta.add_kv_recovery_h2d_receipt(receipt):
++            return
++        try:
++            observer.h2d_receipt_truncated(receipt)
++        except Exception:
++            return
++
+     def _init_worker(self, kv_caches: CanonicalKVCaches) -> None:
+         self.worker = self.spec.get_worker(kv_caches)
+ 
+@@ -306,26 +504,50 @@ class OffloadingConnectorWorker:
+ 
+     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
+         assert self.worker is not None
+-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+-            assert success
+-        self._unsubmitted_store_jobs.clear()
++        self._submit_pending_stores()
+ 
+         if kv_connector_metadata.jobs_to_flush:
++            wait_membership = self._prepare_kv_recovery_wait(
++                kv_connector_metadata.jobs_to_flush
++            )
++            entry_timestamp_ns = (
++                self._profile_clock_ns() if wait_membership is not None else None
++            )
+             self.worker.wait(kv_connector_metadata.jobs_to_flush)
++            if entry_timestamp_ns is not None and wait_membership is not None:
++                self._record_kv_recovery_wait(
++                    wait_membership,
++                    entry_timestamp_ns,
++                )
+ 
+     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+         assert self.worker is not None
+-        for job_id, src_spec, dst_spec in self._unsubmitted_store_jobs:
+-            success = self.worker.submit_store(job_id, src_spec, dst_spec)
+-            assert success
+-        self._unsubmitted_store_jobs.clear()
++        self._submit_pending_stores()
+ 
+         for job_id, entry in metadata.load_jobs.items():
+             self._load_jobs[job_id] = entry.req_id
++            context = None
++            if metadata.kv_recovery_contexts is not None:
++                context = metadata.kv_recovery_contexts.get(job_id)
++            attempt = self._begin_kv_recovery_transfer(job_id, context)
+             assert isinstance(entry.dst_spec, GPULoadStoreSpec)
+-            success = self.worker.submit_load(job_id, entry.src_spec, entry.dst_spec)
++            try:
++                success = self.worker.submit_load(
++                    job_id, entry.src_spec, entry.dst_spec
++                )
++            except Exception:
++                self._record_kv_recovery_not_submitted(attempt)
++                raise
++            if not success:
++                self._record_kv_recovery_not_submitted(attempt)
+             assert success
++            if attempt is not None:
++                timestamp_ns = self._profile_clock_ns()
++                if timestamp_ns is not None and self._record_kv_recovery_submit(
++                    attempt, timestamp_ns
++                ):
++                    assert self._kv_recovery_profiled_attempts is not None
++                    self._kv_recovery_profiled_attempts[job_id] = attempt
+ 
+     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
+         for job_id, entry in metadata.store_jobs.items():
+@@ -336,6 +558,13 @@ class OffloadingConnectorWorker:
+             self._unsubmitted_store_jobs.append(
+                 (job_id, entry.src_spec, entry.dst_spec)
+             )
++            if (
++                self._kv_recovery_store_contexts is not None
++                and metadata.kv_recovery_contexts is not None
++            ):
++                context = metadata.kv_recovery_contexts.get(job_id)
++                if context is not None:
++                    self._kv_recovery_store_contexts[job_id] = context
+ 
+     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
+         """
+@@ -353,7 +582,26 @@ class OffloadingConnectorWorker:
+             # we currently do not support job failures
+             job_id = transfer_result.job_id
+             assert transfer_result.success
++            timestamp_ns = (
++                self._profile_clock_ns()
++                if self._kv_recovery_profiled_attempts is not None
++                else None
++            )
+             is_load = job_id in self._load_jobs
++            attempt = (
++                self._kv_recovery_profiled_attempts.pop(job_id, None)
++                if self._kv_recovery_profiled_attempts is not None
++                else None
++            )
++            if attempt is not None and timestamp_ns is not None:
++                self._record_kv_recovery_completion(
++                    job_id=job_id,
++                    timestamp_ns=timestamp_ns,
++                    success=transfer_result.success,
++                    bytes_moved=transfer_result.transfer_size,
++                    transfer_time=transfer_result.transfer_time,
++                    attempt=attempt,
++                )
+             if (
+                 transfer_result.transfer_time is not None
+                 and transfer_result.transfer_size is not None
+@@ -385,6 +633,15 @@ class OffloadingConnectorWorker:
+     def shutdown(self) -> None:
+         self._unsubmitted_store_jobs.clear()
+         self._load_jobs.clear()
++        if self._kv_recovery_store_contexts is not None:
++            self._kv_recovery_store_contexts.clear()
++        if self._kv_recovery_profiled_attempts is not None:
++            self._kv_recovery_profiled_attempts.clear()
+         self._connector_worker_meta = OffloadingWorkerMetadata()
+-        if self.worker is not None:
+-            self.worker.shutdown()
++        try:
++            if self.worker is not None:
++                self.worker.shutdown()
++        finally:
++            if self._kv_recovery_observer is not None:
++                with suppress(Exception):
++                    self._kv_recovery_observer.close()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+index 20c501fe89..864df4db37 100644
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py
+@@ -39,6 +39,11 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+ from vllm.v1.core.sched.output import SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.kv_offload.factory import OffloadingSpecFactory
++from vllm.v1.kv_recovery_profile import (
++    create_kv_recovery_scheduler_observer,
++    create_kv_recovery_worker_observer,
++    kv_recovery_runtime_scope_authorized,
++)
+ from vllm.v1.outputs import KVConnectorOutput
+ from vllm.v1.request import Request
+ 
+@@ -57,13 +62,30 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
+         super().__init__(vllm_config, role, kv_cache_config)
+ 
+         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
++        kv_recovery_scope_authorized = kv_recovery_runtime_scope_authorized(
++            spec, vllm_config
++        )
+ 
+         self.connector_scheduler: OffloadingConnectorScheduler | None = None
+         self.connector_worker: OffloadingConnectorWorker | None = None
+         if role == KVConnectorRole.SCHEDULER:
+-            self.connector_scheduler = OffloadingConnectorScheduler(spec)
++            self.connector_scheduler = OffloadingConnectorScheduler(
++                spec,
++                kv_recovery_observer=(
++                    create_kv_recovery_scheduler_observer()
++                    if kv_recovery_scope_authorized
++                    else None
++                ),
++            )
+         elif role == KVConnectorRole.WORKER:
+-            self.connector_worker = OffloadingConnectorWorker(spec)
++            self.connector_worker = OffloadingConnectorWorker(
++                spec,
++                kv_recovery_observer=(
++                    create_kv_recovery_worker_observer()
++                    if kv_recovery_scope_authorized
++                    else None
++                ),
++            )
+ 
+     def shutdown(self) -> None:
+         if self.connector_worker is not None:
+diff --git a/vllm/v1/kv_recovery_profile.py b/vllm/v1/kv_recovery_profile.py
+new file mode 100644
+index 0000000000..0a77bb3206
+--- /dev/null
++++ b/vllm/v1/kv_recovery_profile.py
+@@ -0,0 +1,1058 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Default-off runtime ABI for KV-recovery profiling."""
++
++from __future__ import annotations
++
++import hashlib
++import os
++import re
++from dataclasses import dataclass
++from threading import Lock
++from typing import Literal, Protocol
++
++KVRecoveryOperation = Literal["d2h_preserve", "h2d_restore"]
++
++MAX_LOGICAL_BLOCKS_PER_SET = 4096
++MAX_PENDING_H2D_CONTEXTS_PER_PROCESS = 4096
++MAX_H2D_RECEIPTS_PER_WORKER_STEP = 4096
++MAX_RUNTIME_REQUEST_ID_BYTES = 128
++MAX_TRANSFER_IDS_PER_WAIT_SET = 4096
++
++# G1 source wiring is authorized, but runtime activation is not. Keep this
++# source-level gate closed until the remaining authorities and activation
++# review are complete.
++KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED = False
++
++_LOWER_HEX_32_RE = re.compile(r"^[0-9a-f]{32}$")
++_LOWER_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
++_TRANSFER_ID_RE = re.compile(r"^([0-9a-f]{32}):t:(0|[1-9][0-9]{0,19})$")
++_BASE_EVENT_ID_RE = re.compile(r"^[0-9a-f]{32}:e:(0|[1-9][0-9]{0,19})$")
++_PROFILE_RECORD_ID_RE = re.compile(r"^[0-9a-f]{32}:k:(0|[1-9][0-9]{0,19})$")
++_UINT32_MAX = 2**32 - 1
++_UINT64_MAX = 2**64 - 1
++
++
++def _is_uint32(value: object) -> bool:
++    return type(value) is int and 0 <= value <= _UINT32_MAX
++
++
++def _is_uint64(value: object) -> bool:
++    return type(value) is int and 0 <= value <= _UINT64_MAX
++
++
++def _is_positive_uint64(value: object) -> bool:
++    return type(value) is int and 0 < value <= _UINT64_MAX
++
++
++def _is_lower_hex32(value: object) -> bool:
++    return type(value) is str and _LOWER_HEX_32_RE.fullmatch(value) is not None
++
++
++def _is_lower_hex64(value: object) -> bool:
++    return type(value) is str and _LOWER_HEX_64_RE.fullmatch(value) is not None
++
++
++def _matches_scoped_uint64(value: object, pattern: re.Pattern[str]) -> bool:
++    if type(value) is not str:
++        return False
++    match = pattern.fullmatch(value)
++    return match is not None and int(match.group(1)) <= _UINT64_MAX
++
++
++def _matches_transfer_id(value: object) -> bool:
++    if type(value) is not str:
++        return False
++    match = _TRANSFER_ID_RE.fullmatch(value)
++    return match is not None and int(match.group(2)) <= _UINT64_MAX
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryProfileBinding:
++    """Content identities authorized for the default-off G1 implementation."""
++
++    profile_id: str
++    profile_sha256: str
++    communication_mapping_id: str
++    communication_mapping_candidate_sha256: str
++    base_mode_overlay_id: str
++    base_mode_overlay_candidate_sha256: str
++    runtime_commit: str
++    device_plugin_audit_commit: str
++    communication_mapping_status: str
++    base_mode_overlay_status: str
++    communication_mode: str
++    runtime_activation_authorized: bool
++
++
++KV_RECOVERY_PROFILE_BINDING = KVRecoveryProfileBinding(
++    profile_id="rlp.kv-recovery/v1alpha1",
++    profile_sha256=("b363532884d1cae8049ab080d2b85a629f3b33a75f6621788d1e4c8f30737666"),
++    communication_mapping_id="issue2:kv-recovery-v1alpha1",
++    communication_mapping_candidate_sha256=(
++        "dca914f989f3a98d43fb9fa2538f7c43a375e8f22f5deb7e09343aee5ee7bc19"
++    ),
++    base_mode_overlay_id="rlp.trace-mode/kv-offload-v1alpha1",
++    base_mode_overlay_candidate_sha256=(
++        "6e035c29664038cdc93b545538cee6fc31abfb79e455d994851f8c9dbfd1c734"
++    ),
++    runtime_commit="f229ba7cad21a4dba58681af6738a9fd947388e2",
++    device_plugin_audit_commit=("cafad89a5e103f31ea517c1edb56130578c3cd56"),
++    communication_mapping_status="candidate_issue2_authority_pending",
++    base_mode_overlay_status="candidate_owner_ratification_pending",
++    communication_mode="none",
++    runtime_activation_authorized=False,
++)
++
++
++def _activation_gate_open() -> bool:
++    binding = KV_RECOVERY_PROFILE_BINDING
++    return (
++        KV_RECOVERY_RUNTIME_ACTIVATION_AUTHORIZED
++        and binding.runtime_activation_authorized
++        and binding.communication_mapping_status == "approved"
++        and binding.base_mode_overlay_status == "approved"
++        and binding.communication_mode == binding.communication_mapping_id
++    )
++
++
++def _require_printable_ascii(value: str, field_name: str, max_bytes: int) -> None:
++    if type(value) is not str:
++        raise ValueError(f"{field_name} must be a string")
++    try:
++        encoded = value.encode("ascii")
++    except UnicodeEncodeError as exc:
++        raise ValueError(f"{field_name} must be ASCII") from exc
++    if not encoded or len(encoded) > max_bytes or not value.isprintable():
++        raise ValueError(
++            f"{field_name} must be nonempty printable ASCII within {max_bytes} bytes"
++        )
++
++
++@dataclass(frozen=True, slots=True, order=True)
++class KVRecoveryBlockCoordinate:
++    """A logical KV-block coordinate before an opaque ID is assigned."""
++
++    group_index: int
++    logical_ordinal: int
++
++    def __post_init__(self) -> None:
++        if not _is_uint32(self.group_index) or not _is_uint64(self.logical_ordinal):
++            raise ValueError(
++                "logical block group must be uint32 and ordinal must be uint64"
++            )
++
++
++@dataclass(frozen=True, slots=True, order=True)
++class KVRecoveryLogicalBlock:
++    """A canonical run-local logical KV-block identity."""
++
++    group_index: int
++    logical_ordinal: int
++    logical_block_id: str
++
++    def __post_init__(self) -> None:
++        KVRecoveryBlockCoordinate(self.group_index, self.logical_ordinal)
++        if not _is_lower_hex32(self.logical_block_id):
++            raise ValueError("logical_block_id must be 32 lowercase hex characters")
++
++    @property
++    def coordinate(self) -> KVRecoveryBlockCoordinate:
++        return KVRecoveryBlockCoordinate(self.group_index, self.logical_ordinal)
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryIdentity:
++    """Request and recovery-episode identity propagated to transfer workers."""
++
++    run_id: str
++    trace_id: str
++    engine_lifecycle_id: str
++    runtime_request_id: str
++    recovery_epoch: int | None
++    episode_id: str | None
++    base_preempted_event_id: str | None
++
++    def __post_init__(self) -> None:
++        if not _is_lower_hex32(self.run_id):
++            raise ValueError("run_id must be 32 lowercase hex characters")
++        if not _is_lower_hex32(self.trace_id):
++            raise ValueError("trace_id must be 32 lowercase hex characters")
++        if self.engine_lifecycle_id != f"{self.trace_id}:e:0":
++            raise ValueError("engine_lifecycle_id must be trace_id:e:0")
++        _require_printable_ascii(
++            self.runtime_request_id,
++            "runtime_request_id",
++            MAX_RUNTIME_REQUEST_ID_BYTES,
++        )
++        if self.recovery_epoch is None:
++            if self.episode_id is not None or self.base_preempted_event_id is not None:
++                raise ValueError("non-recovery identity cannot carry episode fields")
++            return
++        if not _is_positive_uint64(self.recovery_epoch):
++            raise ValueError("recovery_epoch must be a positive uint64")
++        expected_episode_id = f"{self.engine_lifecycle_id}:k:{self.recovery_epoch}"
++        if self.episode_id != expected_episode_id:
++            raise ValueError("episode_id does not match the recovery epoch")
++        if self.base_preempted_event_id is None:
++            raise ValueError("recovery identity requires base_preempted_event_id")
++        if not _matches_scoped_uint64(self.base_preempted_event_id, _BASE_EVENT_ID_RE):
++            raise ValueError(
++                "base_preempted_event_id must use process_uuid:e:record_seq"
++            )
++
++
++def canonical_block_set_id(
++    binding: KVRecoveryProfileBinding,
++    identity: KVRecoveryIdentity,
++    logical_blocks: tuple[KVRecoveryLogicalBlock, ...],
++) -> str:
++    """Compute the frozen profile's canonical logical block-set digest."""
++    prefix = (
++        f"{binding.profile_id}\0{identity.run_id}\0{identity.engine_lifecycle_id}\0"
++    )
++    rows = "".join(
++        f"{block.group_index}:{block.logical_ordinal}:{block.logical_block_id}\n"
++        for block in logical_blocks
++    )
++    return hashlib.sha256(f"{prefix}{rows}".encode()).hexdigest()
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryTransferContext:
++    """Immutable scheduler-to-worker identity sidecar for one transfer."""
++
++    binding: KVRecoveryProfileBinding
++    identity: KVRecoveryIdentity
++    operation: KVRecoveryOperation
++    block_set_id: str
++    logical_blocks: tuple[KVRecoveryLogicalBlock, ...]
++
++    def __post_init__(self) -> None:
++        if self.binding != KV_RECOVERY_PROFILE_BINDING:
++            raise ValueError("KV-recovery context is bound to an unknown candidate")
++        if not self.logical_blocks:
++            raise ValueError("logical block set must be nonempty")
++        if len(self.logical_blocks) > MAX_LOGICAL_BLOCKS_PER_SET:
++            raise ValueError("logical block set exceeds the frozen bound")
++        if tuple(sorted(self.logical_blocks)) != self.logical_blocks:
++            raise ValueError("logical blocks must use canonical coordinate order")
++        coordinates = [block.coordinate for block in self.logical_blocks]
++        if len(set(coordinates)) != len(coordinates):
++            raise ValueError("logical block coordinates must be unique")
++        logical_ids = [block.logical_block_id for block in self.logical_blocks]
++        if len(set(logical_ids)) != len(logical_ids):
++            raise ValueError("logical block IDs must be unique")
++        if self.operation == "h2d_restore":
++            if self.identity.recovery_epoch is None:
++                raise ValueError("H2D restore requires a recovery episode")
++        elif self.operation == "d2h_preserve":
++            if self.identity.recovery_epoch is not None:
++                raise ValueError("proactive D2H preserve cannot carry an episode")
++        else:
++            raise ValueError(f"unsupported recovery operation: {self.operation}")
++        if not _is_lower_hex64(self.block_set_id):
++            raise ValueError("block_set_id must be lowercase SHA-256")
++        if self.block_set_id != canonical_block_set_id(
++            self.binding, self.identity, self.logical_blocks
++        ):
++            raise ValueError("block_set_id does not match its canonical rows")
++
++    @property
++    def coordinates(self) -> tuple[KVRecoveryBlockCoordinate, ...]:
++        return tuple(block.coordinate for block in self.logical_blocks)
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryTransferAttempt:
++    """Worker-owned transfer identity allocated before backend submission."""
++
++    connector_job_id: int
++    transfer_id: str
++    context: KVRecoveryTransferContext
++
++    def __post_init__(self) -> None:
++        if not _is_uint64(self.connector_job_id):
++            raise ValueError("connector_job_id must be a uint64")
++        if not _matches_transfer_id(self.transfer_id):
++            raise ValueError("transfer_id must use process_uuid:t:transfer_seq")
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryH2DReceipt:
++    """Bounded worker-to-scheduler receipt for a successful H2D transfer."""
++
++    binding: KVRecoveryProfileBinding
++    connector_job_id: int
++    transfer_id: str
++    identity: KVRecoveryIdentity
++    block_set_id: str
++    process_uuid: str
++    rank: int
++    world_size: int
++    clock_domain_id: str
++    communication_done_event_id: str
++    restore_done_profile_record_id: str
++    timestamp_ns: int
++    bytes_moved: int
++
++    def __post_init__(self) -> None:
++        if self.binding != KV_RECOVERY_PROFILE_BINDING:
++            raise ValueError("H2D receipt is bound to an unknown candidate")
++        if not _is_uint64(self.connector_job_id):
++            raise ValueError("connector_job_id must be a uint64")
++        if not _matches_transfer_id(self.transfer_id):
++            raise ValueError("receipt transfer_id is invalid")
++        if not _is_lower_hex32(self.process_uuid):
++            raise ValueError("process_uuid must be 32 lowercase hex characters")
++        if not self.transfer_id.startswith(f"{self.process_uuid}:t:"):
++            raise ValueError("receipt transfer_id must belong to process_uuid")
++        if (
++            type(self.rank) is not int
++            or type(self.world_size) is not int
++            or self.rank != 0
++            or self.world_size != 1
++        ):
++            raise ValueError("KV-recovery receipts require rank=0, world_size=1")
++        if not _is_lower_hex32(self.clock_domain_id):
++            raise ValueError("clock_domain_id must be 32 lowercase hex characters")
++        if not _matches_scoped_uint64(
++            self.communication_done_event_id, _BASE_EVENT_ID_RE
++        ) or not self.communication_done_event_id.startswith(f"{self.process_uuid}:e:"):
++            raise ValueError(
++                "communication_done_event_id must use process_uuid:e:record_seq"
++            )
++        if not _matches_scoped_uint64(
++            self.restore_done_profile_record_id, _PROFILE_RECORD_ID_RE
++        ) or not self.restore_done_profile_record_id.startswith(
++            f"{self.process_uuid}:k:"
++        ):
++            raise ValueError(
++                "restore_done_profile_record_id must use process_uuid:k:record_seq"
++            )
++        if not _is_uint64(self.timestamp_ns) or not _is_positive_uint64(
++            self.bytes_moved
++        ):
++            raise ValueError("receipt timestamp/bytes are invalid")
++        if not _is_lower_hex64(self.block_set_id):
++            raise ValueError("receipt block_set_id must be lowercase SHA-256")
++        if self.identity.recovery_epoch is None:
++            raise ValueError("H2D receipt requires a recovery episode")
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryWaitMembership:
++    """Resolved process-scoped membership frozen before a worker wait."""
++
++    transfer_ids: tuple[str, ...]
++
++    def __post_init__(self) -> None:
++        if not self.transfer_ids:
++            raise ValueError("wait transfer membership must be nonempty")
++        if len(self.transfer_ids) > MAX_TRANSFER_IDS_PER_WAIT_SET:
++            raise ValueError("wait transfer membership exceeds the frozen bound")
++        if tuple(sorted(set(self.transfer_ids))) != self.transfer_ids:
++            raise ValueError("wait transfer IDs must be sorted and unique")
++        if any(not _matches_transfer_id(value) for value in self.transfer_ids):
++            raise ValueError("wait transfer membership contains an invalid ID")
++
++
++@dataclass(frozen=True, slots=True)
++class KVRecoveryWaitAttempt:
++    """Wait-entry point committed only after the worker wait returns."""
++
++    membership: KVRecoveryWaitMembership
++    entry_timestamp_ns: int
++
++    def __post_init__(self) -> None:
++        if not _is_uint64(self.entry_timestamp_ns):
++            raise ValueError("wait-entry timestamp must be a uint64")
++
++    @property
++    def transfer_ids(self) -> tuple[str, ...]:
++        return self.membership.transfer_ids
++
++
++class KVRecoverySchedulerObserver(Protocol):
++    """Scheduler-side identity and receipt observer supplied by a plugin."""
++
++    def prepare_transfer_context(
++        self,
++        runtime_request_id: str,
++        operation: KVRecoveryOperation,
++        coordinates: tuple[KVRecoveryBlockCoordinate, ...],
++    ) -> KVRecoveryTransferContext | None: ...
++
++    def consume_h2d_receipts(
++        self,
++        receipts: tuple[KVRecoveryH2DReceipt, ...],
++        receipts_truncated: bool,
++    ) -> None: ...
++
++    def reset(self, stale_job_threshold: int) -> None: ...
++
++    def close(self) -> None: ...
++
++
++class KVRecoveryWorkerObserver(Protocol):
++    """Worker-side transfer observer supplied by a plugin."""
++
++    def begin_transfer(
++        self,
++        connector_job_id: int,
++        context: KVRecoveryTransferContext,
++    ) -> KVRecoveryTransferAttempt | None: ...
++
++    def transfer_submitted(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++        timestamp_ns: int,
++    ) -> None: ...
++
++    def transfer_not_submitted(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++    ) -> None: ...
++
++    def transfer_completed(
++        self,
++        connector_job_id: int,
++        timestamp_ns: int,
++        success: bool,
++        bytes_moved: int | None,
++        device_duration_ns: int | None,
++    ) -> KVRecoveryH2DReceipt | None: ...
++
++    def prepare_wait(
++        self,
++        connector_job_ids: frozenset[int],
++    ) -> KVRecoveryWaitMembership | None: ...
++
++    def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
++
++    def h2d_receipt_truncated(self, receipt: KVRecoveryH2DReceipt) -> None: ...
++
++    def close(self) -> None: ...
++
++
++class KVRecoveryWorkerEvidenceSink(Protocol):
++    """Nonblocking evidence sink used by the bounded worker observer."""
++
++    def transfer_submitted(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++        timestamp_ns: int,
++    ) -> None: ...
++
++    def transfer_not_submitted(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++    ) -> None: ...
++
++    def transfer_completed(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++        submit_timestamp_ns: int,
++        timestamp_ns: int,
++        success: bool,
++        bytes_moved: int | None,
++        device_duration_ns: int | None,
++    ) -> KVRecoveryH2DReceipt | None: ...
++
++    def pending_h2d_capacity_exhausted(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++        timestamp_ns: int,
++        loss_reason: Literal["serialization_failure"],
++    ) -> None: ...
++
++    def evidence_failure(
++        self,
++        reason: str,
++        connector_job_ids: tuple[int, ...],
++        transfer_ids: tuple[str, ...],
++        timestamp_ns: int | None,
++    ) -> None: ...
++
++    def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None: ...
++
++    def h2d_receipt_truncated(self, receipt: KVRecoveryH2DReceipt) -> None: ...
++
++    def close(
++        self,
++        open_attempts: tuple[KVRecoveryTransferAttempt, ...],
++        evidence_disabled: bool,
++    ) -> None: ...
++
++
++@dataclass(frozen=True, slots=True)
++class _PendingKVRecoveryTransfer:
++    attempt: KVRecoveryTransferAttempt
++    submit_timestamp_ns: int
++
++
++class BoundedKVRecoveryWorkerObserver:
++    """Reference worker observer with the frozen H2D pending-table bound."""
++
++    def __init__(
++        self,
++        process_uuid: str,
++        run_id: str,
++        clock_domain_id: str,
++        sink: KVRecoveryWorkerEvidenceSink,
++    ) -> None:
++        if not _is_lower_hex32(process_uuid):
++            raise ValueError("process_uuid must be 32 lowercase hex characters")
++        if not _is_lower_hex32(run_id):
++            raise ValueError("run_id must be 32 lowercase hex characters")
++        if not _is_lower_hex32(clock_domain_id):
++            raise ValueError("clock_domain_id must be 32 lowercase hex characters")
++        self._process_uuid = process_uuid
++        self._run_id = run_id
++        self._clock_domain_id = clock_domain_id
++        self._sink = sink
++        self._transfer_seq = 0
++        self._prepared_by_job_id: dict[int, KVRecoveryTransferAttempt] = {}
++        self._pending_h2d_by_transfer_id: dict[str, _PendingKVRecoveryTransfer] = {}
++        self._h2d_transfer_id_by_connector_job_id: dict[int, str] = {}
++        self._pending_d2h_by_job_id: dict[int, _PendingKVRecoveryTransfer] = {}
++        # The first state-capacity failure makes formal evidence fail closed.
++        # This single bit replaces an otherwise unbounded dropped-ID table;
++        # serving continues and later untracked completions are ignored.
++        self._evidence_disabled = False
++        self._closed = False
++        # Serialize public calls through sink delivery. The sink contract is
++        # nonblocking and non-reentrant; this makes close a single winner and
++        # prevents a producer callback from occurring after sink.close().
++        self._lifecycle_lock = Lock()
++        self._state_lock = Lock()
++
++    @property
++    def pending_h2d_count(self) -> int:
++        with self._state_lock:
++            return len(self._pending_h2d_by_transfer_id)
++
++    @property
++    def transfer_seq(self) -> int:
++        with self._state_lock:
++            return self._transfer_seq
++
++    @property
++    def evidence_disabled(self) -> bool:
++        with self._state_lock:
++            return self._evidence_disabled
++
++    def begin_transfer(
++        self,
++        connector_job_id: int,
++        context: KVRecoveryTransferContext,
++    ) -> KVRecoveryTransferAttempt | None:
++        with self._lifecycle_lock:
++            failure_reason: str | None = None
++            with self._state_lock:
++                if self._closed:
++                    return None
++                if not _is_uint64(connector_job_id) or not isinstance(
++                    context, KVRecoveryTransferContext
++                ):
++                    failure_reason = "invalid_transfer_identity"
++                    attempt = None
++                elif self._transfer_seq > _UINT64_MAX:
++                    if not self._evidence_disabled:
++                        self._evidence_disabled = True
++                        failure_reason = "transfer_seq_exhausted"
++                    attempt = None
++                else:
++                    transfer_seq = self._transfer_seq
++                    self._transfer_seq += 1
++                    attempt = KVRecoveryTransferAttempt(
++                        connector_job_id=connector_job_id,
++                        transfer_id=f"{self._process_uuid}:t:{transfer_seq}",
++                        context=context,
++                    )
++                    if self._evidence_disabled:
++                        return None
++                    duplicate = (
++                        connector_job_id in self._prepared_by_job_id
++                        or connector_job_id in self._h2d_transfer_id_by_connector_job_id
++                        or connector_job_id in self._pending_d2h_by_job_id
++                    )
++                    if context.identity.run_id != self._run_id:
++                        failure_reason = "foreign_run_transfer"
++                    elif duplicate:
++                        failure_reason = "duplicate_connector_job_id"
++                    elif len(self._prepared_by_job_id) >= (
++                        MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++                    ):
++                        self._evidence_disabled = True
++                        failure_reason = "prepared_transfer_capacity_exhausted"
++                    else:
++                        self._prepared_by_job_id[connector_job_id] = attempt
++                        return attempt
++            if failure_reason is not None:
++                self._sink.evidence_failure(
++                    reason=failure_reason,
++                    connector_job_ids=(
++                        (connector_job_id,) if _is_uint64(connector_job_id) else ()
++                    ),
++                    transfer_ids=(attempt.transfer_id,) if attempt is not None else (),
++                    timestamp_ns=None,
++                )
++            return None
++
++    def transfer_not_submitted(self, attempt: KVRecoveryTransferAttempt) -> None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed:
++                    return
++                prepared = self._prepared_by_job_id.pop(attempt.connector_job_id, None)
++                evidence_disabled = self._evidence_disabled
++            if prepared == attempt:
++                self._sink.transfer_not_submitted(attempt)
++            elif not evidence_disabled:
++                self._sink.evidence_failure(
++                    reason="unknown_rejected_submission",
++                    connector_job_ids=(attempt.connector_job_id,),
++                    transfer_ids=(attempt.transfer_id,),
++                    timestamp_ns=None,
++                )
++
++    def transfer_submitted(
++        self,
++        attempt: KVRecoveryTransferAttempt,
++        timestamp_ns: int,
++    ) -> None:
++        with self._lifecycle_lock:
++            capacity_exhausted = False
++            failure_reason: str | None = None
++            with self._state_lock:
++                if self._closed:
++                    return
++                prepared = self._prepared_by_job_id.pop(attempt.connector_job_id, None)
++                if prepared != attempt:
++                    if not self._evidence_disabled:
++                        failure_reason = "unknown_accepted_submission"
++                elif self._evidence_disabled:
++                    return
++                elif not _is_uint64(timestamp_ns):
++                    self._evidence_disabled = True
++                    failure_reason = "invalid_submit_timestamp"
++                elif (
++                    attempt.context.operation == "h2d_restore"
++                    and len(self._pending_h2d_by_transfer_id)
++                    >= MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++                ):
++                    self._evidence_disabled = True
++                    capacity_exhausted = True
++                elif (
++                    attempt.context.operation == "d2h_preserve"
++                    and len(self._pending_d2h_by_job_id)
++                    >= MAX_PENDING_H2D_CONTEXTS_PER_PROCESS
++                ):
++                    self._evidence_disabled = True
++                    failure_reason = "pending_d2h_capacity_exhausted"
++                else:
++                    pending = _PendingKVRecoveryTransfer(attempt, timestamp_ns)
++                    if attempt.context.operation == "h2d_restore":
++                        self._pending_h2d_by_transfer_id[attempt.transfer_id] = pending
++                        self._h2d_transfer_id_by_connector_job_id[
++                            attempt.connector_job_id
++                        ] = attempt.transfer_id
++                    else:
++                        self._pending_d2h_by_job_id[attempt.connector_job_id] = pending
++            if capacity_exhausted:
++                self._sink.pending_h2d_capacity_exhausted(
++                    attempt,
++                    timestamp_ns,
++                    "serialization_failure",
++                )
++            elif failure_reason is not None:
++                self._sink.evidence_failure(
++                    reason=failure_reason,
++                    connector_job_ids=(attempt.connector_job_id,),
++                    transfer_ids=(attempt.transfer_id,),
++                    timestamp_ns=timestamp_ns,
++                )
++            elif prepared == attempt:
++                self._sink.transfer_submitted(attempt, timestamp_ns)
++
++    def transfer_completed(
++        self,
++        connector_job_id: int,
++        timestamp_ns: int,
++        success: bool,
++        bytes_moved: int | None,
++        device_duration_ns: int | None,
++    ) -> KVRecoveryH2DReceipt | None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed:
++                    return None
++                valid_measurement = (
++                    _is_uint64(connector_job_id)
++                    and _is_uint64(timestamp_ns)
++                    and type(success) is bool
++                    and (bytes_moved is None or _is_positive_uint64(bytes_moved))
++                    and (
++                        device_duration_ns is None
++                        or _is_positive_uint64(device_duration_ns)
++                    )
++                )
++                if not valid_measurement:
++                    evidence_disabled = self._evidence_disabled
++                    pending = None
++                else:
++                    transfer_id = self._h2d_transfer_id_by_connector_job_id.pop(
++                        connector_job_id, None
++                    )
++                    if transfer_id is not None:
++                        pending = self._pending_h2d_by_transfer_id.pop(
++                            transfer_id, None
++                        )
++                    else:
++                        pending = self._pending_d2h_by_job_id.pop(
++                            connector_job_id, None
++                        )
++                    evidence_disabled = self._evidence_disabled
++            if not valid_measurement:
++                if not evidence_disabled:
++                    self._sink.evidence_failure(
++                        reason="invalid_completion_measurement",
++                        connector_job_ids=(
++                            (connector_job_id,) if _is_uint64(connector_job_id) else ()
++                        ),
++                        transfer_ids=(),
++                        timestamp_ns=(
++                            timestamp_ns if _is_uint64(timestamp_ns) else None
++                        ),
++                    )
++                return None
++            if pending is None:
++                if not evidence_disabled:
++                    self._sink.evidence_failure(
++                        reason="unknown_completion",
++                        connector_job_ids=(connector_job_id,),
++                        transfer_ids=(),
++                        timestamp_ns=timestamp_ns,
++                    )
++                return None
++            if evidence_disabled:
++                return None
++            if (
++                timestamp_ns < pending.submit_timestamp_ns
++                or (
++                    pending.attempt.context.operation == "d2h_preserve"
++                    and timestamp_ns <= pending.submit_timestamp_ns
++                )
++                or (success and bytes_moved is None)
++            ):
++                self._sink.evidence_failure(
++                    reason="invalid_completion_measurement",
++                    connector_job_ids=(connector_job_id,),
++                    transfer_ids=(pending.attempt.transfer_id,),
++                    timestamp_ns=timestamp_ns,
++                )
++                return None
++            receipt = self._sink.transfer_completed(
++                attempt=pending.attempt,
++                submit_timestamp_ns=pending.submit_timestamp_ns,
++                timestamp_ns=timestamp_ns,
++                success=success,
++                bytes_moved=bytes_moved,
++                device_duration_ns=device_duration_ns,
++            )
++            context = pending.attempt.context
++            if context.operation == "d2h_preserve":
++                if receipt is not None:
++                    self._sink.evidence_failure(
++                        reason="unexpected_d2h_receipt",
++                        connector_job_ids=(connector_job_id,),
++                        transfer_ids=(pending.attempt.transfer_id,),
++                        timestamp_ns=timestamp_ns,
++                    )
++                return None
++            if receipt is None:
++                return None
++            if not isinstance(receipt, KVRecoveryH2DReceipt):
++                self._sink.evidence_failure(
++                    reason="invalid_h2d_receipt",
++                    connector_job_ids=(connector_job_id,),
++                    transfer_ids=(pending.attempt.transfer_id,),
++                    timestamp_ns=timestamp_ns,
++                )
++                return None
++            if (
++                not success
++                or bytes_moved is None
++                or bytes_moved <= 0
++                or receipt.connector_job_id != connector_job_id
++                or receipt.transfer_id != pending.attempt.transfer_id
++                or receipt.binding != context.binding
++                or receipt.identity != context.identity
++                or receipt.block_set_id != context.block_set_id
++                or receipt.process_uuid != self._process_uuid
++                or receipt.clock_domain_id != self._clock_domain_id
++                or receipt.rank != 0
++                or receipt.world_size != 1
++                or receipt.timestamp_ns != timestamp_ns
++                or receipt.bytes_moved != bytes_moved
++                or receipt.timestamp_ns <= pending.submit_timestamp_ns
++            ):
++                self._sink.evidence_failure(
++                    reason="invalid_h2d_receipt",
++                    connector_job_ids=(connector_job_id,),
++                    transfer_ids=(pending.attempt.transfer_id,),
++                    timestamp_ns=timestamp_ns,
++                )
++                return None
++            return receipt
++
++    def prepare_wait(
++        self,
++        connector_job_ids: frozenset[int],
++    ) -> KVRecoveryWaitMembership | None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed or self._evidence_disabled:
++                    return None
++            if (
++                not connector_job_ids
++                or len(connector_job_ids) > MAX_TRANSFER_IDS_PER_WAIT_SET
++            ):
++                self._sink.evidence_failure(
++                    reason="invalid_wait_membership",
++                    connector_job_ids=(),
++                    transfer_ids=(),
++                    timestamp_ns=None,
++                )
++                return None
++            valid_connector_job_ids = all(
++                _is_uint64(job_id) for job_id in connector_job_ids
++            )
++            if not valid_connector_job_ids:
++                self._sink.evidence_failure(
++                    reason="invalid_wait_membership",
++                    connector_job_ids=(),
++                    transfer_ids=(),
++                    timestamp_ns=None,
++                )
++                return None
++            with self._state_lock:
++                pending: list[_PendingKVRecoveryTransfer | None] = []
++                for job_id in sorted(connector_job_ids):
++                    transfer_id = self._h2d_transfer_id_by_connector_job_id.get(job_id)
++                    if transfer_id is not None:
++                        entry = self._pending_h2d_by_transfer_id.get(transfer_id)
++                    else:
++                        entry = self._pending_d2h_by_job_id.get(job_id)
++                    pending.append(entry)
++            if any(entry is None for entry in pending):
++                self._sink.evidence_failure(
++                    reason="invalid_wait_membership",
++                    connector_job_ids=tuple(sorted(connector_job_ids)),
++                    transfer_ids=(),
++                    timestamp_ns=None,
++                )
++                return None
++            if any(
++                entry is not None
++                and (
++                    entry.attempt.context.identity.run_id != self._run_id
++                    or not entry.attempt.transfer_id.startswith(
++                        f"{self._process_uuid}:t:"
++                    )
++                )
++                for entry in pending
++            ):
++                self._sink.evidence_failure(
++                    reason="foreign_wait_membership",
++                    connector_job_ids=tuple(sorted(connector_job_ids)),
++                    transfer_ids=(),
++                    timestamp_ns=None,
++                )
++                return None
++            return KVRecoveryWaitMembership(
++                tuple(
++                    sorted(
++                        entry.attempt.transfer_id
++                        for entry in pending
++                        if entry is not None
++                    )
++                )
++            )
++
++    def wait_completed(self, attempt: KVRecoveryWaitAttempt) -> None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed or self._evidence_disabled:
++                    return
++            self._sink.wait_completed(attempt)
++
++    def h2d_receipt_truncated(self, receipt: KVRecoveryH2DReceipt) -> None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed:
++                    return
++            self._sink.h2d_receipt_truncated(receipt)
++
++    def close(self) -> None:
++        with self._lifecycle_lock:
++            with self._state_lock:
++                if self._closed:
++                    return
++                self._closed = True
++                open_attempts = tuple(
++                    sorted(
++                        (
++                            *self._prepared_by_job_id.values(),
++                            *(
++                                pending.attempt
++                                for pending in self._pending_h2d_by_transfer_id.values()
++                            ),
++                            *(
++                                pending.attempt
++                                for pending in self._pending_d2h_by_job_id.values()
++                            ),
++                        ),
++                        key=lambda attempt: attempt.transfer_id,
++                    )
++                )
++                evidence_disabled = self._evidence_disabled
++                self._prepared_by_job_id.clear()
++                self._pending_h2d_by_transfer_id.clear()
++                self._h2d_transfer_id_by_connector_job_id.clear()
++                self._pending_d2h_by_job_id.clear()
++            self._sink.close(open_attempts, evidence_disabled)
++
++
++class KVRecoveryObserverFactory(Protocol):
++    """Role-specific observer factory registered during plugin bootstrap."""
++
++    def reinitialize_after_fork(self, binding: KVRecoveryProfileBinding) -> None: ...
++
++    def create_scheduler_observer(
++        self, binding: KVRecoveryProfileBinding
++    ) -> KVRecoverySchedulerObserver | None: ...
++
++    def create_worker_observer(
++        self, binding: KVRecoveryProfileBinding
++    ) -> KVRecoveryWorkerObserver | None: ...
++
++
++_observer_factory: KVRecoveryObserverFactory | None = None
++_observer_factory_lock = Lock()
++_observer_factory_pid = os.getpid()
++_observer_factory_ready_pid = _observer_factory_pid
++
++
++def prepare_kv_recovery_profile_after_fork() -> None:
++    """Replace an inherited factory lock before child plugin registration."""
++    if not _activation_gate_open():
++        return
++    global _observer_factory_lock, _observer_factory_pid
++    process_id = os.getpid()
++    if process_id != _observer_factory_pid:
++        _observer_factory_lock = Lock()
++        _observer_factory_pid = process_id
++
++
++def register_kv_recovery_observer_factory(
++    factory: KVRecoveryObserverFactory,
++) -> None:
++    """Register the optional observer factory exactly once per process."""
++    if not _activation_gate_open():
++        return
++    prepare_kv_recovery_profile_after_fork()
++    global _observer_factory, _observer_factory_ready_pid
++    with _observer_factory_lock:
++        if _observer_factory is not None and _observer_factory is not factory:
++            if _observer_factory_ready_pid == _observer_factory_pid:
++                raise RuntimeError(
++                    "a KV-recovery observer factory is already registered"
++                )
++            _observer_factory = factory
++            _observer_factory_ready_pid = _observer_factory_pid
++        if _observer_factory is None:
++            _observer_factory = factory
++            _observer_factory_ready_pid = _observer_factory_pid
++
++
++def _get_ready_observer_factory(
++    *,
++    force_reinitialize: bool,
++) -> KVRecoveryObserverFactory | None:
++    global _observer_factory, _observer_factory_ready_pid
++    with _observer_factory_lock:
++        factory = _observer_factory
++        if factory is None:
++            return None
++        if (
++            not force_reinitialize
++            and _observer_factory_ready_pid == _observer_factory_pid
++        ):
++            return factory
++        try:
++            factory.reinitialize_after_fork(KV_RECOVERY_PROFILE_BINDING)
++        except Exception:
++            _observer_factory = None
++            _observer_factory_ready_pid = _observer_factory_pid
++            return None
++        _observer_factory_ready_pid = _observer_factory_pid
++        return factory
++
++
++def reinitialize_kv_recovery_profile_after_fork() -> None:
++    """Reinitialize an explicitly registered plugin after worker bootstrap."""
++    if not _activation_gate_open():
++        return
++    prepare_kv_recovery_profile_after_fork()
++    _get_ready_observer_factory(force_reinitialize=True)
++
++
++def kv_recovery_runtime_scope_authorized(
++    offloading_spec: object,
++    vllm_config: object,
++) -> bool:
++    """Limit dormant G1 wiring to the exact approved runtime family."""
++    if not _activation_gate_open():
++        return False
++    additional_config = getattr(vllm_config, "additional_config", None)
++    if (
++        not isinstance(additional_config, dict)
++        or additional_config.get("recompute_scheduler_enable") is not False
++    ):
++        return False
++    try:
++        from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
++    except Exception:
++        return False
++    return type(offloading_spec) is TieringOffloadingSpec
++
++
++def create_kv_recovery_scheduler_observer() -> KVRecoverySchedulerObserver | None:
++    """Create a scheduler observer, returning no-op state on plugin failure."""
++    if not _activation_gate_open():
++        return None
++    prepare_kv_recovery_profile_after_fork()
++    factory = _get_ready_observer_factory(force_reinitialize=False)
++    if factory is None:
++        return None
++    try:
++        return factory.create_scheduler_observer(KV_RECOVERY_PROFILE_BINDING)
++    except Exception:
++        return None
++
++
++def create_kv_recovery_worker_observer() -> KVRecoveryWorkerObserver | None:
++    """Create a worker observer, returning no-op state on plugin failure."""
++    if not _activation_gate_open():
++        return None
++    prepare_kv_recovery_profile_after_fork()
++    factory = _get_ready_observer_factory(force_reinitialize=False)
++    if factory is None:
++        return None
++    try:
++        return factory.create_worker_observer(KV_RECOVERY_PROFILE_BINDING)
++    except Exception:
++        return None
+-- 
+2.53.0.windows.3
+

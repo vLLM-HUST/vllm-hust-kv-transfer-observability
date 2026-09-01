@@ -1,0 +1,164 @@
+From 628874305b77ba918d985e00eae07d3408de7922 Mon Sep 17 00:00:00 2001
+From: Xie Hanlong <xiehanlong834@gmail.com>
+Date: Tue, 4 Aug 2026 17:18:03 +0800
+Subject: [PATCH] test: satisfy pre-commit gates (SPDX, mypy, ruff)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pre-commit merge-gate failures from advisor review (2026-08-04 09:02):
+
+- Add SPDX license/copyright headers to all 7 new Python files
+  (check-spdx-header).
+- b134_descriptor_layout.py: rename the os.open() file descriptor from
+  descriptor to d — the loop variable descriptor (dict) and the fd
+  shared one name, causing 3 mypy errors.
+- test_b134_chain_contract.py: narrow node.end_lineno (int | None) before
+  comparison.
+- test_b134_scheduler_restore.py: fix type: ignore codes (method-assign
+  for __getattr__ assignment; attr-defined for dynamic PauseState stub).
+
+Local: 13 b134 tests pass; mypy clean on all 7 files; ruff check/format
+clean.
+
+Co-authored-by: Hermes Agent
+---
+ tests/v1/test_b134_chain_contract.py             | 11 +++++++++--
+ tests/v1/test_b134_descriptor_layout.py          |  2 ++
+ tests/v1/test_b134_events.py                     |  2 ++
+ tests/v1/test_b134_runtime_paths.py              |  2 ++
+ tests/v1/test_b134_scheduler_restore.py          |  6 ++++--
+ vllm/v1/b134_events.py                           |  2 ++
+ vllm/v1/kv_offload/cpu/b134_descriptor_layout.py |  8 +++++---
+ 7 files changed, 26 insertions(+), 7 deletions(-)
+
+diff --git a/tests/v1/test_b134_chain_contract.py b/tests/v1/test_b134_chain_contract.py
+index a11113d0e2..59beb3db5e 100644
+--- a/tests/v1/test_b134_chain_contract.py
++++ b/tests/v1/test_b134_chain_contract.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Source-level contract tests for the B134 six-event chain ordering.
+ 
+ These tests do not import vLLM runtime modules (no torch/tblib needed): they
+@@ -35,12 +37,17 @@ def _emit_calls(tree: ast.AST) -> list[tuple[str, int]]:
+ def _is_gated_on_log_stats(tree: ast.AST, emit_lineno: int) -> bool:
+     """True if the emit at emit_lineno sits inside an ``if self.log_stats``."""
+     for node in ast.walk(tree):
+-        if (
++        if not (
+             isinstance(node, ast.If)
+             and isinstance(node.test, ast.Attribute)
+             and node.test.attr == "log_stats"
+-            and node.lineno < emit_lineno <= node.end_lineno
+         ):
++            continue
++        end_lineno = node.end_lineno
++        if end_lineno is None:
++            # Defensive: ast.If always has end_lineno on Python >= 3.8.
++            continue
++        if node.lineno < emit_lineno <= end_lineno:
+             return True
+     return False
+ 
+diff --git a/tests/v1/test_b134_descriptor_layout.py b/tests/v1/test_b134_descriptor_layout.py
+index 7f3d0652fc..82af299442 100644
+--- a/tests/v1/test_b134_descriptor_layout.py
++++ b/tests/v1/test_b134_descriptor_layout.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import importlib.util
+ import json
+ import os
+diff --git a/tests/v1/test_b134_events.py b/tests/v1/test_b134_events.py
+index be51b6a803..fc741018c6 100644
+--- a/tests/v1/test_b134_events.py
++++ b/tests/v1/test_b134_events.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import importlib.util
+ import json
+ from pathlib import Path
+diff --git a/tests/v1/test_b134_runtime_paths.py b/tests/v1/test_b134_runtime_paths.py
+index 5a972173e1..920414528a 100644
+--- a/tests/v1/test_b134_runtime_paths.py
++++ b/tests/v1/test_b134_runtime_paths.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Runtime-path tests for the B134 event chain.
+ 
+ Unlike the AST contract tests (test_b134_chain_contract.py), these tests
+diff --git a/tests/v1/test_b134_scheduler_restore.py b/tests/v1/test_b134_scheduler_restore.py
+index eb6f0ade86..2870eacc2c 100644
+--- a/tests/v1/test_b134_scheduler_restore.py
++++ b/tests/v1/test_b134_scheduler_restore.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Runtime-path tests for the B134 event chain (scheduler restore branch).
+ 
+ The scheduler restore branch lives deep inside ``Scheduler.schedule()``
+@@ -25,7 +27,7 @@ def _make_module(name: str, **attrs) -> types.ModuleType:
+         # multi-line `from X import A, B, C` always resolves.
+         return MagicMock()
+ 
+-    mod.__getattr__ = _fallback  # type: ignore[attr-defined]
++    mod.__getattr__ = _fallback  # type: ignore[method-assign]
+     for k, v in attrs.items():
+         setattr(mod, k, v)
+     return mod
+@@ -116,7 +118,7 @@ def _load_scheduler_module():
+             PAUSED_ALL="PAUSED_ALL",
+         ),
+     )
+-    stubs["vllm.v1.core.sched.interface"].PauseState = pause_state
++    stubs["vllm.v1.core.sched.interface"].PauseState = pause_state  # type: ignore[attr-defined]
+     add(
+         "vllm.v1.core.sched.output",
+         SchedulerOutput=MagicMock,
+diff --git a/vllm/v1/b134_events.py b/vllm/v1/b134_events.py
+index 9aecc3e367..3052b892bc 100644
+--- a/vllm/v1/b134_events.py
++++ b/vllm/v1/b134_events.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Optional JSONL events for the KV tiering benchmark contract."""
+ 
+ import json
+diff --git a/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py b/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py
+index ad35cf986d..287a296c9c 100644
+--- a/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py
++++ b/vllm/v1/kv_offload/cpu/b134_descriptor_layout.py
+@@ -1,3 +1,5 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """Optional normalized descriptor capture for B134 layout probes."""
+ 
+ import json
+@@ -57,15 +59,15 @@ def capture_descriptor_layout(
+     data = (
+         json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+     ).encode("utf-8")
+-    descriptor = os.open(
++    fd = os.open(
+         output,
+         os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+         0o600,
+     )
+     try:
+-        written = os.write(descriptor, data)
++        written = os.write(fd, data)
+         if written != len(data):
+             raise OSError("short descriptor inventory write")
+     finally:
+-        os.close(descriptor)
++        os.close(fd)
+     return output
+-- 
+2.53.0.windows.3
+
