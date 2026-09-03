@@ -122,6 +122,31 @@ def test_closed_event_vocabulary_has_valid_field_shapes() -> None:
     assert all(record.to_payload()["schema"].endswith(".v2") for record in records)
 
 
+def test_completion_keeps_optional_device_duration_distinct() -> None:
+    record = KVTransferObservation(
+        ObservationEvent.TRANSFER_COMPLETED,
+        identity=identity(),
+        transfer=transfer(),
+        direction=TransferDirection.H2D,
+        bytes_moved=128,
+        duration_ns=20,
+        device_duration_ns=7,
+    )
+    payload = record.to_payload()
+    assert payload["duration_ns"] == 20
+    assert payload["device_duration_ns"] == 7
+
+    with pytest.raises(ValueError, match="device_duration_ns"):
+        KVTransferObservation(
+            ObservationEvent.TRANSFER_STARTED,
+            identity=identity(),
+            transfer=transfer(),
+            direction=TransferDirection.H2D,
+            bytes_moved=128,
+            device_duration_ns=7,
+        )
+
+
 @pytest.mark.parametrize(
     ("factory", "message"),
     [

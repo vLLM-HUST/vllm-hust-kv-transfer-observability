@@ -69,3 +69,8 @@ Descriptor inventories use the same bounded identity, typed relative regions,
 directory confinement, and atomic publication. See
 [`docs/observation_core.md`](docs/observation_core.md) for the schemas, bounds,
 failure policy, and counters.
+
+The initial host-independent lifecycle normalizer maps the merged legacy core
+transfer/recovery callbacks and the core/Ascend first-compute forwarding
+semantics into the same canonical records. It remains detached from any host;
+see [`docs/normalization.md`](docs/normalization.md).

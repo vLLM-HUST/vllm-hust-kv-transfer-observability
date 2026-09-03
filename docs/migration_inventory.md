@@ -169,3 +169,21 @@ publication, and concurrent emit/capture/close.
 This status does not satisfy the later host-adapter, configuration lifecycle,
 compatibility matrix, real hardware, performance, CI-permission, or activation
 requirements. The manifest remains `import_only`.
+
+## Phase 3 initial implementation status
+
+`normalization.py` now contains the first host-independent normalization and
+correlation slice derived from core #236 and Ascend #216. It distinguishes D2H
+preserve, H2D restore, backend failure, explicit invalidation, requeue,
+admission, and first compute; requires explicit bounded identities and exact
+recovered rosters; and keeps host-observed and device-event durations separate.
+
+The state is bounded and runtime calls fail open. Capacity loss and an invalid
+first-compute roster invalidate subsequent formal evidence without taking over
+or changing host execution. Tests exercise equivalent core/Ascend
+first-compute normalization, ordering, identity mismatch, capacity, close,
+failure, and cancellation behavior.
+
+This is not a real host adapter. B134 vocabulary reconciliation and descriptor
+region identity remain open Phase 3 items, and current-host callback
+verification remains Phase 4 work.

@@ -25,6 +25,10 @@ result.
 Unknown events, unknown fields, arbitrary error strings, raw addresses, device
 pointers, and KV payloads have no representation in the schema.
 
+Completed preserve, transfer, and restore observations may additionally carry
+`device_duration_ns`. It is kept distinct from the host-observed
+`duration_ns`; neither value is inferred from the other.
+
 Every record carries a printable ASCII request ID of at most 128 bytes, a
 uint64 worker generation, uint32 rank, optional positive uint64 recovery epoch,
 and uint64 monotonic timestamp. Transfer and receipt IDs retain the merged

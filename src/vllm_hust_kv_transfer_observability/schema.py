@@ -188,6 +188,7 @@ class KVTransferObservation:
     bytes_moved: int | None = None
     block_count: int | None = None
     duration_ns: int | None = None
+    device_duration_ns: int | None = None
 
     def __post_init__(self) -> None:
         if type(self.event) is not ObservationEvent:
@@ -229,6 +230,10 @@ class KVTransferObservation:
             _require_positive_uint(self.block_count, "block_count", UINT32_MAX)
         if self.duration_ns is not None:
             _require_uint(self.duration_ns, "duration_ns", UINT64_MAX)
+        if self.device_duration_ns is not None:
+            _require_positive_uint(
+                self.device_duration_ns, "device_duration_ns", UINT64_MAX
+            )
         self._validate_event_shape()
 
     def _validate_event_shape(self) -> None:
@@ -245,6 +250,7 @@ class KVTransferObservation:
                 "bytes_moved",
                 "block_count",
                 "duration_ns",
+                "device_duration_ns",
             )
             if getattr(self, name) not in (None, ())
         }
@@ -303,6 +309,17 @@ class KVTransferObservation:
                 "compute_kind",
             },
         }
+        has_device_duration = "device_duration_ns" in populated
+        if has_device_duration:
+            populated.remove("device_duration_ns")
+            if self.event not in {
+                ObservationEvent.PRESERVE_COMPLETED,
+                ObservationEvent.TRANSFER_COMPLETED,
+                ObservationEvent.RESTORE_COMPLETED,
+            }:
+                raise ValueError(
+                    "device_duration_ns is only valid for completed transfers"
+                )
         if populated != shapes[self.event]:
             raise ValueError(
                 f"fields do not match the closed schema for {self.event.value}"
@@ -390,6 +407,7 @@ class KVTransferObservation:
             "bytes_moved": self.bytes_moved,
             "block_count": self.block_count,
             "duration_ns": self.duration_ns,
+            "device_duration_ns": self.device_duration_ns,
         }
         payload.update(
             {key: value for key, value in optional.items() if value is not None}
