@@ -15,6 +15,8 @@ ALLOWED_EVIDENCE_LABELS = {
     "simulation/model",
 }
 
+DESCRIPTOR_SCHEMA = "vllm-hust.kv-transfer-descriptor-layout.v1"
+
 
 class DescriptorLayoutCapture:
     def __init__(self, capture_dir: str | Path, evidence_label: str) -> None:
@@ -64,7 +66,7 @@ class DescriptorLayoutCapture:
             "direction": direction,
             "evidence_label": self.evidence_label,
             "job_id": job_id,
-            "schema": "vllm-hust.kv-transfer-descriptor-layout.v1",
+            "schema": DESCRIPTOR_SCHEMA,
         }
         data = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode()
         fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -76,4 +78,4 @@ class DescriptorLayoutCapture:
         return output
 
 
-__all__ = ["ALLOWED_EVIDENCE_LABELS", "DescriptorLayoutCapture"]
+__all__ = ["ALLOWED_EVIDENCE_LABELS", "DESCRIPTOR_SCHEMA", "DescriptorLayoutCapture"]
