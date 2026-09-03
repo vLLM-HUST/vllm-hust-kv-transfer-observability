@@ -58,9 +58,18 @@ from vllm_hust_kv_transfer_observability import (
     JsonlKVTransferEventSink,
 )
 
-# Event sink: pass a path to enable, None keeps it inert.
+# Event sink: pass a path to enable, None keeps it inert. request_id always
+# denotes the request; jobs/epochs/ranks use their own optional fields.
 with JsonlKVTransferEventSink("/tmp/kv-transfer-events.jsonl") as sink:
     sink.emit("restore_done", "request-1", keys=16)
+    sink.emit(
+        "transfer_submit",
+        "request-1",
+        transfer_id="job-7",
+        recovery_epoch=2,
+        rank=3,
+        bytes=4096,
+    )
 
 # Descriptor capture: directory must already exist; files are 0600, O_EXCL.
 capture = DescriptorLayoutCapture("/tmp/kv-layouts", "real-online")
@@ -71,9 +80,14 @@ capture.capture(
 )
 ```
 
-Both sinks reject process addresses: the event vocabulary and the descriptor v1
-schema are fail-closed (see `HOST_CONTRACT.md`), and captured files never
-contain address material.
+Both sinks are fail-closed and address-free by implementation, not by promise:
+
+- `JsonlKVTransferEventSink.emit` rejects event names outside the adapter
+  vocabulary (`EVENT_VOCABULARY_V1`, 10 events, see `HOST_CONTRACT.md`) and
+  rejects address-like field names (e.g. `src_address`, `data_ptr`); the
+  disabled path stays a single no-op guard.
+- `DescriptorLayoutCapture` rejects any descriptor that is not exactly the
+  four-key v1 schema, and captured files never contain address material.
 
 ## Uninstall
 

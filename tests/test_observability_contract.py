@@ -1,8 +1,9 @@
 """Contract tests migrated from the legacy B134 suite (core-pr-220).
 
 These tests pin the sink/descriptor semantics that legacy PR #220 defined
-(append ordering, fail-closed descriptors, default-off zero side effects)
-without importing any vLLM runtime module, so they run in plain pytest.
+(append ordering, fail-closed descriptors, default-off zero side effects,
+bounded identity) without importing any vLLM runtime module, so they run in
+plain pytest.
 """
 
 import json
@@ -13,22 +14,52 @@ import pytest
 
 from vllm_hust_kv_transfer_observability import (
     ALLOWED_EVIDENCE_LABELS,
+    DESCRIPTOR_SCHEMA,
+    EVENT_VOCABULARY_V1,
     DescriptorLayoutCapture,
     JsonlKVTransferEventSink,
 )
 
 EVENT_SCHEMA = "vllm-hust.kv-transfer-event.v1"
-DESCRIPTOR_SCHEMA = "vllm-hust.kv-transfer-descriptor-layout.v1"
 
 
 # --- JsonlKVTransferEventSink ---
 
 
+def test_vocabulary_is_pinned_and_host_events_excluded() -> None:
+    # Decision A (2026-09-03): scheduler-layer events belong to the host
+    # EventBus (vllm-hust#6), never to this adapter's sink.
+    assert (
+        frozenset(
+            {
+                "restore_start",
+                "restore_done",
+                "cpu_store",
+                "cpu_evict",
+                "evict",
+                "transfer_submit",
+                "swap_d2h_submit",
+                "gather_h2d",
+                "copy_observed_complete",
+                "sched_step",
+            }
+        )
+        == EVENT_VOCABULARY_V1
+    )
+    assert {
+        "preempt",
+        "wakeup",
+        "admission",
+        "scheduled",
+    } & EVENT_VOCABULARY_V1 == set()
+
+
 def test_sink_default_off_has_no_side_effects() -> None:
     sink = JsonlKVTransferEventSink(None)
     assert sink.enabled is False
-    # A disabled sink must not raise and must not create any file.
-    sink.emit("preempt", "request-1")
+    # A disabled sink must not raise (even for unknown events: the no-op guard
+    # precedes validation) and must not create any file.
+    sink.emit("made_up_event", "request-1")
     sink.emit("restore_start", "request-1", keys=3)
     sink.close()
 
@@ -42,12 +73,13 @@ def test_sink_is_explicitly_enabled_by_path(tmp_path) -> None:
 def test_sink_appends_preserve_event_order(tmp_path) -> None:
     """JSONL must keep the exact per-request emit order (legacy contract)."""
     output = tmp_path / "chain.jsonl"
+    events = ("restore_start", "cpu_store", "restore_done")
     with JsonlKVTransferEventSink(output) as sink:
-        for event in ("wakeup", "admission", "scheduled"):
+        for event in events:
             sink.emit(event, "request-1")
 
-    events = [json.loads(line)["event"] for line in output.read_text().splitlines()]
-    assert events == ["wakeup", "admission", "scheduled"]
+    emitted = [json.loads(line)["event"] for line in output.read_text().splitlines()]
+    assert emitted == list(events)
 
 
 def test_sink_rejects_empty_event_or_request_id(tmp_path) -> None:
@@ -55,7 +87,26 @@ def test_sink_rejects_empty_event_or_request_id(tmp_path) -> None:
     with pytest.raises(ValueError):
         sink.emit("", "request-1")
     with pytest.raises(ValueError):
-        sink.emit("preempt", "")
+        sink.emit("restore_start", "")
+    sink.close()
+
+
+def test_sink_rejects_out_of_vocabulary_events(tmp_path) -> None:
+    """Fail-closed: host-owned scheduler events are not sink events."""
+    sink = JsonlKVTransferEventSink(tmp_path / "events.jsonl")
+    for event in ("preempt", "wakeup", "admission", "scheduled"):
+        with pytest.raises(ValueError, match="outside the v1 vocabulary"):
+            sink.emit(event, "request-1")
+    sink.close()
+
+
+def test_sink_rejects_address_like_fields(tmp_path) -> None:
+    """Address material must never reach disk through the event path."""
+    sink = JsonlKVTransferEventSink(tmp_path / "events.jsonl")
+    with pytest.raises(ValueError, match="address-like"):
+        sink.emit("transfer_submit", "request-1", data_ptr=0x7F00)
+    with pytest.raises(ValueError, match="address-like"):
+        sink.emit("cpu_store", "request-1", src_address=123)
     sink.close()
 
 
@@ -71,6 +122,39 @@ def test_sink_records_schema_pid_and_timestamp(tmp_path) -> None:
     assert payload["fields"] == {"bytes": 4096, "descriptors": 4}
     assert isinstance(payload["pid"], int)
     assert isinstance(payload["ts_monotonic_ns"], int)
+
+
+def test_sink_records_optional_identity_fields(tmp_path) -> None:
+    """Bounded identity: job/epoch/rank/generation never fold into request_id."""
+    output = tmp_path / "events.jsonl"
+    with JsonlKVTransferEventSink(output) as sink:
+        sink.emit(
+            "transfer_submit",
+            "request-7",
+            transfer_id="job-42",
+            recovery_epoch=2,
+            rank=3,
+            generation=1,
+            bytes=4096,
+        )
+        # Without identity args the payload carries none of them.
+        sink.emit("restore_done", "request-8", keys=4)
+
+    records = [json.loads(line) for line in output.read_text().splitlines()]
+    assert records[0]["request_id"] == "request-7"
+    assert records[0]["transfer_id"] == "job-42"
+    assert records[0]["recovery_epoch"] == 2
+    assert records[0]["rank"] == 3
+    assert records[0]["generation"] == 1
+    assert "transfer_id" not in records[1]
+    assert "recovery_epoch" not in records[1]
+
+
+def test_sink_rejects_empty_transfer_id(tmp_path) -> None:
+    sink = JsonlKVTransferEventSink(tmp_path / "events.jsonl")
+    with pytest.raises(ValueError, match="transfer_id"):
+        sink.emit("transfer_submit", "request-1", transfer_id="")
+    sink.close()
 
 
 @pytest.mark.skipif(

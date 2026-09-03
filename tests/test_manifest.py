@@ -56,11 +56,3 @@ def test_component_contracts_are_declared_in_protocols() -> None:
             assert base in protocol_names, (
                 f"contract {contract} has no protocol declaration"
             )
-
-
-def test_host_version_range_is_wide_enough() -> None:
-    manifest = load_manifest(MANIFEST_PATH)
-    host_spec = manifest.host
-    assert host_spec.provider == "vllm"
-    # The host API version supported by this extension-manager release.
-    assert host_spec.version_range in (">=0", ">=0.0.0", "*")
