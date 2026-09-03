@@ -1,5 +1,16 @@
 """KV transfer observability primitives and an inert activation descriptor."""
 
+from .b134 import (
+    B134_EVENT_CONTRACTS,
+    B134_EVENT_COUNT,
+    B134_RECOVERY_CHAIN,
+    UNIFIED_SOURCE_EVENT_COUNT_WITH_FIRST_COMPUTE,
+    B134Event,
+    B134EventContract,
+    B134IdentityKind,
+    B134Owner,
+    b134_event_contract,
+)
 from .descriptors import (
     ALLOWED_EVIDENCE_LABELS,
     DescriptorCaptureCounters,
@@ -40,6 +51,14 @@ class VllmHustKvTransferObservabilityContractProposal:
 
 __all__ = [
     "ALLOWED_EVIDENCE_LABELS",
+    "B134_EVENT_CONTRACTS",
+    "B134_EVENT_COUNT",
+    "B134_RECOVERY_CHAIN",
+    "UNIFIED_SOURCE_EVENT_COUNT_WITH_FIRST_COMPUTE",
+    "B134Event",
+    "B134EventContract",
+    "B134IdentityKind",
+    "B134Owner",
     "ComputeKind",
     "CoreRecoveryAdmitted",
     "CoreRecoveryRequeued",
@@ -67,4 +86,5 @@ __all__ = [
     "TransferOperation",
     "TransferTerminalReason",
     "VllmHustKvTransferObservabilityContractProposal",
+    "b134_event_contract",
 ]

@@ -35,6 +35,8 @@ def inventory(
                 dst_offset=index * 16 + 8,
                 size=16,
                 direction=TransferDirection.H2D,
+                src_region_id=index,
+                dst_region_id=index,
             )
             for index in range(region_count)
         ),
@@ -53,6 +55,8 @@ def test_descriptor_capture_is_correlated_address_free_and_atomic(
         assert payload["identity"]["worker_generation"] == 7
         assert payload["transfer_id"] == f"{PROCESS_UUID}:t:2"
         assert payload["descriptors"][0]["size"] == 16
+        assert payload["descriptors"][0]["src_region_id"] == 0
+        assert payload["descriptors"][0]["dst_region_id"] == 0
         assert "address" not in json.dumps(payload)
         assert "payload" not in json.dumps(payload)
         assert stat.S_IMODE(output.stat().st_mode) == 0o600
@@ -68,8 +72,33 @@ def test_descriptor_inventory_rejects_unsafe_job_ids(job_id) -> None:
             transfer=TransferIdentity(f"{PROCESS_UUID}:t:1"),
             job_id=job_id,
             direction=TransferDirection.D2H,
-            regions=(DescriptorRegion(0, 0, 1, TransferDirection.D2H),),
+            regions=(DescriptorRegion(0, 0, 1, TransferDirection.D2H, 0, 0),),
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("src_region_id", True),
+        ("src_region_id", -1),
+        ("src_region_id", 2**32),
+        ("dst_region_id", "dst_tensor_0"),
+        ("dst_region_id", -1),
+        ("dst_region_id", 2**32),
+    ],
+)
+def test_descriptor_region_identity_is_bounded(field: str, value: object) -> None:
+    fields = {
+        "src_offset": 0,
+        "dst_offset": 0,
+        "size": 1,
+        "direction": TransferDirection.D2H,
+        "src_region_id": 0,
+        "dst_region_id": 0,
+    }
+    fields[field] = value
+    with pytest.raises(ValueError, match=field):
+        DescriptorRegion(**fields)  # type: ignore[arg-type]
 
 
 def test_capture_rejects_untyped_records_without_raising(tmp_path: Path) -> None:

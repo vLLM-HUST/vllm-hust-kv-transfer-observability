@@ -74,7 +74,7 @@ wrap it silently at installation time.
 | Legacy source | Relevant behavior | Classification | Planned plugin destination or treatment |
 |---|---|---|---|
 | core #220 `vllm/v1/b134_events.py` | JSONL event emission | plugin-owned seed | replace open strings/`**fields` with typed records in `events.py`; add safe bounded writer behavior |
-| core #220 `vllm/v1/kv_offload/cpu/b134_descriptor_layout.py` | address-free relative descriptor capture | plugin-owned seed | harden `descriptors.py` with identity/path/inventory bounds and atomic publication |
+| core #220 `vllm/v1/kv_offload/cpu/b134_descriptor_layout.py` and NPU worker call site | address-free relative descriptor capture with tensor-region labels | plugin-owned seed plus host-owned observation | harden `descriptors.py` with identity/path/inventory bounds, bounded numeric region IDs, and atomic publication |
 | core #220 scheduler/CPU/NPU/tiering edits | event timing and call sites | host-owned observations | use only to identify event meaning; do not copy execution paths into the plugin |
 | core #220 tests | event order and runtime fixtures | reusable test semantics | rewrite host-independent cases under plugin tests; use fixtures for adapter tests |
 | core #236 `vllm/v1/kv_recovery_profile.py` | bounded identities, transfer/wait/first-compute receipts, observer interfaces/state | mixed | migrate typed identities, normalization, bounded correlation, and accounting into plugin modules; keep host callback invocation as a seam |
@@ -184,6 +184,13 @@ or changing host execution. Tests exercise equivalent core/Ascend
 first-compute normalization, ordering, identity mismatch, capacity, close,
 failure, and cancellation behavior.
 
-This is not a real host adapter. B134 vocabulary reconciliation and descriptor
-region identity remain open Phase 3 items, and current-host callback
-verification remains Phase 4 work.
+The exact B134 14-event vocabulary and ownership/field contracts are recorded
+in `b134.py`; its four lossless lifecycle correspondences are explicit, while
+the remaining scheduler/phase measurements are not mislabelled as canonical
+transitions. Descriptor v2 preserves legacy tensor-region identity as bounded
+numeric source/destination IDs. Focused fixtures now cover Worker generation
+changes, duplicate/missing/out-of-order events, identity mismatch, unknown
+input, overbound rosters, and equivalent core/Ascend first-compute results.
+
+This is not a real host adapter. Translation from exact current-host callback
+objects remains Phase 4 work.

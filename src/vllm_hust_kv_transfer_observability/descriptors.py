@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Final
 
 from .schema import (
+    UINT32_MAX,
     UINT64_MAX,
     ObservationIdentity,
     TransferDirection,
@@ -50,6 +51,8 @@ class DescriptorRegion:
     dst_offset: int
     size: int
     direction: TransferDirection
+    src_region_id: int
+    dst_region_id: int
 
     def __post_init__(self) -> None:
         _require_uint(self.src_offset, "src_offset")
@@ -59,12 +62,24 @@ class DescriptorRegion:
             raise ValueError("size must be positive")
         if type(self.direction) is not TransferDirection:
             raise ValueError("direction must be a TransferDirection")
+        if (
+            type(self.src_region_id) is not int
+            or not 0 <= self.src_region_id <= UINT32_MAX
+        ):
+            raise ValueError("src_region_id must be a uint32")
+        if (
+            type(self.dst_region_id) is not int
+            or not 0 <= self.dst_region_id <= UINT32_MAX
+        ):
+            raise ValueError("dst_region_id must be a uint32")
 
     def to_payload(self) -> dict[str, int | str]:
         return {
             "direction": self.direction.value,
+            "dst_region_id": self.dst_region_id,
             "dst_offset": self.dst_offset,
             "size": self.size,
+            "src_region_id": self.src_region_id,
             "src_offset": self.src_offset,
         }
 

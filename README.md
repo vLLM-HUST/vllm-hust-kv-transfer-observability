@@ -73,4 +73,6 @@ failure policy, and counters.
 The initial host-independent lifecycle normalizer maps the merged legacy core
 transfer/recovery callbacks and the core/Ascend first-compute forwarding
 semantics into the same canonical records. It remains detached from any host;
-see [`docs/normalization.md`](docs/normalization.md).
+the exact legacy B134 vocabulary and its lossless canonical correspondences are
+also recorded without accepting arbitrary event strings. See
+[`docs/normalization.md`](docs/normalization.md).

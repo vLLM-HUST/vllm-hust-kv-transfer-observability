@@ -208,6 +208,24 @@ def test_admission_requires_exact_completed_restore_identity() -> None:
     assert normalizer.evidence_valid
 
 
+def test_worker_generation_change_rejects_stale_restore_receipt() -> None:
+    normalizer = LifecycleNormalizer()
+    complete_restore(normalizer, request_identity=identity(generation=2))
+    next_generation = identity(generation=3)
+    assert (
+        normalizer.normalize(
+            CoreRecoveryAdmitted(
+                next_generation,
+                (transfer(),),
+                observed_at_ns=40,
+            )
+        )
+        is None
+    )
+    assert normalizer.counters.invalid == 1
+    assert normalizer.evidence_valid
+
+
 def test_admission_and_first_compute_preserve_temporal_order() -> None:
     normalizer = LifecycleNormalizer()
     complete_restore(normalizer)
@@ -272,6 +290,111 @@ def test_first_compute_roster_mismatch_disables_formal_evidence() -> None:
     )
     assert normalizer.counters.invalid == 1
     assert normalizer.counters.evidence_disabled_dropped == 1
+
+
+def test_duplicate_source_events_are_rejected_without_replacing_state() -> None:
+    normalizer = LifecycleNormalizer()
+    submitted = CoreTransferSubmitted(
+        identity(),
+        transfer(),
+        TransferOperation.H2D_RESTORE,
+        block_count=1,
+        observed_at_ns=10,
+    )
+    assert normalizer.normalize(submitted) is not None
+    assert normalizer.normalize(submitted) is None
+    completed = CoreTransferCompleted(
+        transfer(),
+        observed_at_ns=20,
+        success=True,
+        bytes_moved=128,
+        receipt=receipt(),
+    )
+    assert normalizer.normalize(completed) is not None
+    assert normalizer.normalize(completed) is None
+
+    admitted = CoreRecoveryAdmitted(identity(), (transfer(),), observed_at_ns=30)
+    assert normalizer.normalize(admitted) is not None
+    assert normalizer.normalize(admitted) is None
+
+    first_compute = FirstComputeObserved(
+        SourceHost.VLLM,
+        identity(),
+        receipt(2),
+        (transfer(),),
+        ComputeKind.DECODE,
+        observed_at_ns=40,
+    )
+    assert normalizer.normalize(first_compute) is not None
+    assert normalizer.normalize(first_compute) is None
+    assert normalizer.counters.invalid == 4
+    assert not normalizer.evidence_valid
+
+
+def test_missing_source_events_are_explicitly_rejected() -> None:
+    missing_submit = LifecycleNormalizer()
+    assert (
+        missing_submit.normalize(
+            CoreTransferCompleted(transfer(), observed_at_ns=20, success=False)
+        )
+        is None
+    )
+
+    missing_receipt = LifecycleNormalizer()
+    assert (
+        missing_receipt.normalize(
+            CoreTransferSubmitted(
+                identity(),
+                transfer(),
+                TransferOperation.H2D_RESTORE,
+                block_count=1,
+                observed_at_ns=10,
+            )
+        )
+        is not None
+    )
+    assert (
+        missing_receipt.normalize(
+            CoreTransferCompleted(
+                transfer(),
+                observed_at_ns=20,
+                success=True,
+                bytes_moved=128,
+            )
+        )
+        is None
+    )
+
+    missing_admission = LifecycleNormalizer()
+    assert (
+        missing_admission.normalize(
+            FirstComputeObserved(
+                SourceHost.VLLM_ASCEND,
+                identity(),
+                receipt(2),
+                (transfer(),),
+                ComputeKind.DECODE,
+                observed_at_ns=40,
+            )
+        )
+        is None
+    )
+    assert not missing_admission.evidence_valid
+
+
+def test_source_rosters_reject_more_than_4096_transfer_ids() -> None:
+    transfers = tuple(sorted(transfer(sequence) for sequence in range(1, 4098)))
+    with pytest.raises(ValueError, match="bounded association"):
+        CoreRecoveryAdmitted(identity(), transfers, observed_at_ns=30)
+    with pytest.raises(ValueError, match="bounded association"):
+        FirstComputeObserved(
+            SourceHost.VLLM_ASCEND,
+            identity(),
+            receipt(2),
+            transfers,
+            ComputeKind.DECODE,
+            observed_at_ns=40,
+        )
 
 
 def test_capacity_is_bounded_and_disables_incomplete_evidence() -> None:

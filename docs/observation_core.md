@@ -66,8 +66,11 @@ closed-drop, and shutdown-timeout counts.
 
 `DescriptorInventory` requires the same request/generation/rank/recovery and
 transfer identity plus a uint64 job ID, direction, timestamp, and a nonempty
-tuple of at most 4096 `DescriptorRegion` values. A region contains only uint64
-source offset, destination offset, positive size, and direction.
+tuple of at most 4096 `DescriptorRegion` values. A region contains uint32 source
+and destination region IDs, uint64 region-relative source/destination offsets,
+positive size, and direction. The bounded numeric IDs preserve the legacy
+`src_tensor_<tensor_idx>`/`dst_tensor_<tensor_idx>` distinction without storing
+an arbitrary caller-controlled name.
 
 `DescriptorLayoutCapture` rejects a symlink or invalid directory during
 construction, pins the directory descriptor and identity, creates a mode-0600

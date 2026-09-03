@@ -5,8 +5,9 @@ provider must supply these seams before activation:
 
 1. `vllm.kv-transfer.events.v2`: typed lifecycle events for preserve, transfer start,
    transfer completion, restore, failure, and cancellation.
-2. `vllm.kv-transfer.descriptors.v2`: typed region-relative offsets and sizes only;
-   process addresses, device pointers, and KV payloads are forbidden.
+2. `vllm.kv-transfer.descriptors.v2`: bounded numeric source/destination region
+   IDs plus typed region-relative offsets and sizes; process addresses, device
+   pointers, arbitrary region names, and KV payloads are forbidden.
 3. `vllm.kv-transfer.identity.v1`: stable request, transfer, rank, and process IDs
    with bounded cardinality.
 4. `vllm.kv-transfer.observer.v1`: default-off observer registration outside the
