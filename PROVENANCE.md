@@ -116,7 +116,7 @@ copied into the current core-only patch directory.
 ## Migration boundary
 
 The detailed file/symbol classification and planned plugin destinations are in
-[`docs/migration_inventory.md`](docs/migration_inventory.md). In summary:
+[`docs/source_inventory.md`](docs/source_inventory.md). In summary:
 
 - event schemas, bounded identities, normalization, receipts, safe sinks, and
   correlation state belong in this plugin;

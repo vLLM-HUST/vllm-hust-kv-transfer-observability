@@ -1,9 +1,9 @@
-# Issue #2 migration inventory
+# Issue #2 source and integration inventory
 
-This document is the Phase 0/1 source-to-destination checklist for Issue #2.
-It records observed repository facts and the work explicitly requested by the
-issue. It does not add an approval gate, activate the plugin, or claim host or
-hardware compatibility.
+This document records the source-to-destination inventory for Issue #2. It
+captures observed repository facts, migration boundaries, implemented plugin
+components, and work that still requires real host or hardware evidence. It
+does not activate the plugin or claim host or hardware compatibility.
 
 Audit date: 2026-09-02 UTC.
 
@@ -18,13 +18,14 @@ Audit date: 2026-09-02 UTC.
 | legacy core #236 head | `e6cd22e1a915aedb3a1204cf085fa017557abdf9` |
 | legacy Ascend #216 head | `66ded6084db0ff8fb58fa288dcbfecce54798bdb` |
 
-## Phase 0 baseline and reproduced gaps
+## Bootstrap baseline and reproduced gaps
 
 The unchanged bootstrap passes Ruff, format checking, three unit tests, source
 and wheel build, Extension Manager discovery/check, and expected rejection of
 enablement while its implementation remains `import_only`.
 
-Focused local probes reproduced these gaps without changing implementation:
+Focused reproduction checks confirmed these gaps without changing the
+bootstrap implementation:
 
 | Boundary | Reproduced behavior | Required later test/fix |
 |---|---|---|
@@ -38,8 +39,8 @@ Focused local probes reproduced these gaps without changing implementation:
 | compatibility | manifest declares host `>=0` and proposed protocols | replace with tested versions and reject unsupported combinations |
 | CI | template is `.github/extension-ci.yml` | permissioned workflow must ultimately live under `.github/workflows/` |
 
-These are implementation inputs for later phases, not evidence that the
-plugin is ready to attach to a service.
+These findings are implementation inputs, not evidence that the plugin is
+ready to attach to a service.
 
 ## Current-host seam audit
 
@@ -60,9 +61,10 @@ Current `vllm-hust` does expose:
 Generic plugin loading does not by itself deliver typed transfer/recovery/
 first-compute callbacks. The OffloadingConnector methods are execution-owned
 internal paths, not a verified observer ABI. Therefore the plugin cannot claim
-real attachment at these revisions. Phase 4 must first verify a supported
-current extensibility route; if none supplies a required observation, the
-separate host change must be limited to the missing default-off callback.
+real attachment at these revisions. Host integration must first verify a
+supported current extensibility route; if none supplies a required
+observation, the separate host change must be limited to the missing
+default-off callback.
 
 Current `vllm-ascend-hust` runs model forward from
 `NPUModelRunner.execute_model`, but no longer contains the optional helper from
@@ -141,10 +143,10 @@ files already exist.
 | fixed compatibility matrix | compatibility module and docs | exact tested Python/manager/vLLM/Ascend/hardware/model/features |
 | closed configuration/lifecycle | configuration and lifecycle modules/docs | unknown/conflict/dependency/disable/rollback/uninstall tests |
 | real correctness/performance evidence | benchmark/evidence tooling and result records | exact commands/environment/commits/raw repetitions on target hardware |
-| executable operator documentation | installation and operations docs | clean-environment reproduction without workspace-specific paths |
+| executable operator documentation | installation and operations docs | clean-environment reproduction without developer-specific paths |
 | actual CI workflow | `.github/workflows/ci.yml` | maintainer with workflow permission installs it; normal checks pass |
 
-## Phase 1 exit check
+## Provenance and inventory verification
 
 - Core #217/#220/#221/#236 and Ascend #216 are inventoried with exact heads,
   merge state, authors, license, files, and semantic roles.
@@ -157,20 +159,20 @@ files already exist.
 - No legacy patch has been bulk-applied, no runtime code has been changed, and
   the manifest remains `import_only`.
 
-## Phase 2 local implementation status
+## Implemented bounded observation core
 
-The host-independent Phase 2 core now implements the mapped schema and sink
-work in `schema.py`, `events.py`, and `descriptors.py`. Focused tests cover all
-closed event shapes, identity and association bounds, unknown/mismatched input,
+The host-independent core implements the mapped schema and sink work in
+`schema.py`, `events.py`, and `descriptors.py`. Focused tests cover all closed
+event shapes, identity and association bounds, unknown/mismatched input,
 record/queue/file capacity, short writes, runtime destination failure,
 symlinks, directory replacement, conflicts, partial-write cleanup, atomic
 publication, and concurrent emit/capture/close.
 
-This status does not satisfy the later host-adapter, configuration lifecycle,
-compatibility matrix, real hardware, performance, CI-permission, or activation
-requirements. The manifest remains `import_only`.
+The current implementation does not yet satisfy host-adapter, configuration
+lifecycle, compatibility matrix, real hardware, performance, CI-permission,
+or activation requirements. The manifest remains `import_only`.
 
-## Phase 3 initial implementation status
+## Implemented lifecycle normalization
 
 `normalization.py` now contains the first host-independent normalization and
 correlation slice derived from core #236 and Ascend #216. It distinguishes D2H
@@ -193,4 +195,4 @@ changes, duplicate/missing/out-of-order events, identity mismatch, unknown
 input, overbound rosters, and equivalent core/Ascend first-compute results.
 
 This is not a real host adapter. Translation from exact current-host callback
-objects remains Phase 4 work.
+objects remains host-integration work.

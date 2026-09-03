@@ -1,8 +1,8 @@
 # Typed bounded observation core
 
-This document describes the host-independent Phase 2 implementation. It is not
-a host attachment, compatibility claim, activation guide, or performance
-result.
+This document describes the host-independent observation implementation. It
+is not a host attachment, compatibility claim, activation guide, or
+performance result.
 
 ## Closed event model
 
@@ -55,8 +55,8 @@ The bounded worker queue uses non-blocking admission. The writer uses an
 explicit destination, `O_NOFOLLOW`, a pinned directory descriptor, append-mode
 file locking, complete-write loops, and rollback to the previous file length
 after a partial write failure. When the file limit is reached, subsequent
-records are dropped; this phase intentionally does not rotate or overwrite
-evidence.
+records are dropped; the current implementation intentionally does not rotate
+or overwrite evidence.
 
 `EventSinkCounters` reports enqueued, written, queue-dropped,
 record-size-dropped, file-capacity-dropped, serialization-error, I/O-error,

@@ -1,8 +1,8 @@
 # Lifecycle normalization and correlation
 
-This document describes the first host-independent Phase 3 implementation. It
-does not activate the extension, import a host runtime, register callbacks, or
-claim current-host compatibility.
+This document describes the host-independent lifecycle normalization and
+correlation implementation. It does not activate the extension, import a host
+runtime, register callbacks, or claim current-host compatibility.
 
 ## Source scope
 
@@ -61,7 +61,7 @@ The other ten events remain explicitly classified scheduler or supplemental
 phase measurements. They are not relabelled as lifecycle transitions because
 that would manufacture identity or semantics absent from the source. A future
 host adapter may forward them through a separately defined measurement schema,
-but this Phase 3 work does not invent that schema.
+but this implementation does not invent that schema.
 
 Even the four corresponding names cannot construct a canonical record from the
 legacy payload alone: B134 embedded a job number in `request_id` and did not
@@ -86,12 +86,12 @@ evidence unusable (`evidence_valid == False`) while remaining fail-open for
 serving. Closing is idempotent, clears correlation state, and causes later
 observations to be counted and dropped.
 
-## Remaining Phase 3 work
+## Remaining host-integration work
 
 - add the adapter-facing translation from exact current-host callback objects
-  only after Phase 4 verifies that those callbacks really exist.
+  only after verifying that those callbacks really exist.
 
 The B134 vocabulary is now reconciled and descriptor v2 uses bounded numeric
 source/destination region IDs derived from the legacy tensor index. Real host
-translation remains Phase 4 and does not authorize changing the manifest from
-`import_only`.
+translation remains separate integration work and does not authorize changing
+the manifest from `import_only`.
