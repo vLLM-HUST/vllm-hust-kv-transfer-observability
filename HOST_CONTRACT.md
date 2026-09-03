@@ -1,4 +1,4 @@
-# KV transfer observability host contract proposal
+# KV transfer observability host contract
 
 The extracted sinks are host-independent and receive immutable data. A vLLM host
 provider must supply these seams before activation:
@@ -15,3 +15,72 @@ provider must supply these seams before activation:
 The Extension Manager may configure and validate the sink. It must not read KV
 payloads, own transfer lifecycle, or enable filesystem writes without an explicit
 operator-provided destination.
+
+## Event vocabulary (v1)
+
+Normative vocabulary extracted from the legacy B134 instrumentation (vllm-hust
+core PR #220, author @xiehanlong834-gif; see `docs/semantic-audit.md`). A host
+adapter emitting an event name outside this vocabulary MUST be rejected by
+configuration validation. `request_id` carries either a request id or a transfer
+job id (`job<N>`, emitted by transfer/worker evidence).
+
+Recovery / request lifecycle (per request):
+
+| event | emitted when | originating layer |
+|---|---|---|
+| `preempt` | request preempted and returned to waiting | scheduler |
+| `restore_start` | load of a preempted request begins | tiering manager |
+| `restore_done` | load of a preempted request completes | tiering manager |
+| `wakeup` | a PREEMPTED request is resumed | scheduler |
+| `admission` | request admitted to running set | scheduler |
+| `scheduled` | request scheduled for execution | scheduler |
+
+Transfer / worker evidence (per job):
+
+| event | normative payload fields |
+|---|---|
+| `cpu_store` | duration_us, evicted_keys, stored_keys |
+| `cpu_evict` | duration_us, evicted_keys |
+| `evict` | duration_us, keys |
+| `transfer_submit` | bytes, descriptors, direction, descriptor_us, dependency_us, submit_us |
+| `swap_d2h_submit` | descriptors, duration_us |
+| `gather_h2d` | dma_runs, duration_us |
+| `copy_observed_complete` | bytes, direction, completion_observed_ms, device_event_ms |
+| `sched_step` | duration_us |
+
+### Ordering contract
+
+Hard constraints (pinned by tests in the legacy suite; a host adapter MUST
+preserve them):
+
+- Scheduler restore path: `wakeup` -> `admission` -> `scheduled`.
+- Restore data path: `restore_start` -> `restore_done`.
+- `cpu_store` emission must be reachable, i.e. appear before any early return in
+  the prepare-store path.
+- None of `preempt` / `wakeup` / `admission` / `scheduled` may be gated on the
+  vLLM `log_stats` flag: observability must be independent of stats logging.
+
+Intended full-chain order for one preempted request:
+
+`preempt` -> (store evidence: `cpu_store` / `cpu_evict` / `evict`) ->
+`restore_start` -> `restore_done` -> `wakeup` -> `admission` -> `scheduled`.
+
+## Timing semantics
+
+- Ascend `swap_blocks_batch` device-event elapsed time is unreliable for phase
+  accounting. Host adapters MUST use wall-clock phase durations (`*_us`) and MUST
+  keep completion-observation latency distinct from device event time:
+  `copy_observed_complete` carries `completion_observed_ms` (host wall clock) and
+  `device_event_ms` together.
+- When observability is disabled (no sink configured), host code MUST take the
+  zero-overhead path: no `time.monotonic()` call, no payload construction, no
+  dependency on vLLM stats flags.
+
+## Descriptor layout v1 boundaries (open question)
+
+Legacy #220 descriptors carried region identity (`src_region` / `dst_region`,
+e.g. `src_tensor_0`). The extracted v1 schema keeps region-relative offsets only
+and rejects extra fields (fail-closed). Region identity must be re-attached
+either by per-region capture invocations from the host adapter or by extending
+the v1 schema with region ids. This decision must be settled before activation;
+details in `docs/semantic-audit.md`.
