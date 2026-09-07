@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - the supported hosts are POSIX
 DEFAULT_MAX_PENDING_RECORDS: Final = 4096
 DEFAULT_MAX_RECORD_BYTES: Final = 1024 * 1024
 DEFAULT_MAX_FILE_BYTES: Final = 64 * 1024 * 1024
-_MIN_RECORD_BYTES: Final = 512
+MIN_RECORD_BYTES: Final = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,8 +63,8 @@ class JsonlKVTransferEventSink:
         )
         self.max_record_bytes = self._positive_int(max_record_bytes, "max_record_bytes")
         self.max_file_bytes = self._positive_int(max_file_bytes, "max_file_bytes")
-        if self.max_record_bytes < _MIN_RECORD_BYTES:
-            raise ValueError(f"max_record_bytes must be at least {_MIN_RECORD_BYTES}")
+        if self.max_record_bytes < MIN_RECORD_BYTES:
+            raise ValueError(f"max_record_bytes must be at least {MIN_RECORD_BYTES}")
         if self.max_file_bytes < self.max_record_bytes:
             raise ValueError("max_file_bytes must be >= max_record_bytes")
 
@@ -283,4 +283,5 @@ __all__ = [
     "DEFAULT_MAX_RECORD_BYTES",
     "EventSinkCounters",
     "JsonlKVTransferEventSink",
+    "MIN_RECORD_BYTES",
 ]
