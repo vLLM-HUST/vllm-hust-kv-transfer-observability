@@ -11,16 +11,16 @@ the host maintainers retain ownership of the final public module and API names.
 
 | Component | Revision |
 |---|---|
-| `vLLM-HUST/vllm-hust` `main` | `88e606d0f0cde63c412db456f3e92da2609e0438` |
-| `vLLM-HUST/vllm-ascend-hust` `main` | `c0d6294bc30f775151dba256d49a37a29ba939d7` |
+| `vLLM-HUST/vllm-hust` `main` | `6cdc0304a8bac6f0275a7aa90493226aa38d83f4` |
+| `vLLM-HUST/vllm-ascend-hust` `main` | `74f0c0a272376412b51e1c1864803d5f3a0f1b5f` |
 | `vLLM-HUST/extension-manager` `main` | `cf1ea71e3e2cb81ab06267ef05eddb3e580ea20b` |
-| plugin branch point | `d2599e7b4a25ae58ee6909b14899409fc07fd4d0` |
+| plugin `main` after PR #5 | `ec3446d936b6ac148e0be33b1dba831f9ecfc0c4` |
 
-The Ascend revision differs from the code-audited parent
-`d92617b002409cf9bbedd7a2af8b889696653230` only by a core-version CI marker.
-The audit also considered open core PRs #3 and #6. Neither is merged or a KV
-transfer API. Both currently add their own `vllm/v1/events.py`; this proposal
-must not be implemented as a third competing event bus.
+The audit was refreshed after the core and Ascend upstream synchronizations.
+It also considered open core PRs #3 and #6. Neither is merged or a KV transfer
+API. Both currently add their own `vllm/v1/events.py`; current core `main` does
+not contain that module, and this proposal must not be implemented as a third
+competing event bus.
 
 ## Current facts and missing observations
 
@@ -36,6 +36,15 @@ but no public KV lifecycle observer registration:
   and `shutdown` own Worker-side submission, completion, and cleanup;
 - `vllm/v1/kv_offload/base.py::TransferResult` exposes job ID, success, and
   optional transfer size/time internally.
+
+Current core also has opt-in self-describing offloading cache events in
+`offloading/events.py`. `OffloadingEventsTracker` translates internal
+offloading residency changes into `BlockStored` and `BlockRemoved` records.
+Those records are intended for cache-residency consumers and may contain block
+hashes and token IDs. They do not publish transfer submission/completion,
+recovery epoch, Worker generation, H2D receipt, or first-compute identity, so
+they cannot be relabelled or consumed as this plugin's address-free lifecycle
+seam.
 
 These facts are not an external ABI. Worker completion still asserts success,
 and the public structures do not carry a recovery epoch, Worker generation,
