@@ -44,6 +44,18 @@ class AdapterActivationError(RuntimeError):
     """The adapter could not safely attach before serving callbacks began."""
 
 
+class AdapterContractError(AdapterActivationError):
+    """The binding contract could not be inspected or was incompatible."""
+
+
+class AdapterResourceError(AdapterActivationError):
+    """Plugin resource initialization failed before host registration."""
+
+
+class AdapterRegistrationError(AdapterActivationError):
+    """Host registration failed or returned no removable handle."""
+
+
 class AdapterState(str, Enum):
     STOPPED = "stopped"
     STARTING = "starting"
@@ -132,11 +144,7 @@ class KVTransferHostAdapter:
                     max_record_bytes=self.config.max_descriptor_record_bytes,
                 )
         except Exception:
-            normalizer.close()
-            if sink is not None:
-                sink.close(self.config.shutdown_timeout_seconds)
-            if capture is not None:
-                capture.close()
+            self._close_prepared_resources(normalizer, sink, capture)
             raise
         return normalizer, sink, capture
 
@@ -151,17 +159,17 @@ class KVTransferHostAdapter:
             try:
                 contract_version = getattr(binding, "contract_version", None)
             except Exception as exc:
-                raise AdapterActivationError(
+                raise AdapterContractError(
                     "host binding contract could not be inspected"
                 ) from exc
             if contract_version != HOST_OBSERVER_CONTRACT:
-                raise AdapterActivationError(
+                raise AdapterContractError(
                     f"host binding must provide {HOST_OBSERVER_CONTRACT}"
                 )
             try:
                 normalizer, sink, capture = self._prepare_resources()
             except Exception as exc:
-                raise AdapterActivationError(
+                raise AdapterResourceError(
                     "observer destinations could not be initialized"
                 ) from exc
 
@@ -185,7 +193,7 @@ class KVTransferHostAdapter:
                     self._sink = None
                     self._descriptor_capture = None
                     self._state = AdapterState.STOPPED
-                raise AdapterActivationError(
+                raise AdapterRegistrationError(
                     "host observer registration failed"
                 ) from exc
 
@@ -199,7 +207,7 @@ class KVTransferHostAdapter:
     def _close_prepared_resources(
         self,
         normalizer: LifecycleNormalizer,
-        sink: JsonlKVTransferEventSink,
+        sink: JsonlKVTransferEventSink | None,
         capture: DescriptorLayoutCapture | None,
     ) -> bool:
         cleanup_ok = True
@@ -214,12 +222,16 @@ class KVTransferHostAdapter:
             except Exception:
                 cleanup_ok = False
                 self._increment("cleanup_errors")
+        if sink is None:
+            return cleanup_ok
         try:
             sink_ok = sink.close(self.config.shutdown_timeout_seconds)
         except Exception:
-            sink_ok = False
             self._increment("cleanup_errors")
+            return False
         if not sink_ok:
+            # The sink returns False only when its writer is still alive.
+            # Close exceptions are cleanup errors, not shutdown timeouts.
             self._increment("shutdown_timeouts")
         return cleanup_ok and sink_ok
 
@@ -311,7 +323,10 @@ class KVTransferHostAdapter:
 
 __all__ = [
     "AdapterActivationError",
+    "AdapterContractError",
     "AdapterCounters",
+    "AdapterRegistrationError",
+    "AdapterResourceError",
     "AdapterState",
     "HOST_OBSERVER_CONTRACT",
     "HostObserverBinding",

@@ -9,6 +9,9 @@ the host maintainers retain ownership of the final public module and API names.
 
 ## Audited revisions
 
+Audit snapshot: 2026-09-11. These revisions describe inspected code, not a
+promise that moving host branches expose a compatible API.
+
 | Component | Revision |
 |---|---|
 | `vLLM-HUST/vllm-hust` `main` | `6cdc0304a8bac6f0275a7aa90493226aa38d83f4` |
@@ -85,6 +88,13 @@ and counted without affecting serving.
 
 ## Minimal host behavior
 
+The plugin-side review on 2026-09-18 recommends core `OffloadingConnector`
+D2H/H2D CPU offload as the first integration target, using the existing
+connector metadata and Worker-to-scheduler output channels for identity and
+receipt handoff. These are proposed integration choices, not verified host
+support. Historical Ascend B134 transfer behavior does not by itself prove a
+working transfer path or first-compute receipt on current Ascend hardware.
+
 ### Registration and dispatch
 
 The host should expose one process-local typed observer registry, preferably as
@@ -104,6 +114,13 @@ part of whichever common EventBus design is accepted for core PRs #3/#6:
 This proposal does not require the host EventBus to serialize plugin records.
 The out-of-tree adapter performs validation, normalization, bounded queueing,
 and JSONL/descriptor publication.
+
+The intended binding is one sink on the shared host bus, not a separate
+registry. The core PR #6 author recommends its `register_sink` shape, but its
+request-finished/preempted events alone do not supply KV transfer, recovery or
+first-compute observations. Resume-side scheduler events remain a separate
+gap. The plugin's `register`/`unregister` protocol wraps the eventual host API;
+it does not dictate that API's method names.
 
 ### Transfer identity handoff
 

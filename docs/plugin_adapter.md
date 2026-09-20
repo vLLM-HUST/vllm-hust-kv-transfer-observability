@@ -18,6 +18,11 @@ A binding declares the exact contract string
 accept only the closed `SourceObservation` union and `DescriptorInventory`;
 arbitrary dictionaries and fields are dropped.
 
+These are plugin-internal callback types. The source-specific binding lives in
+the plugin and translates host-owned event objects into `SourceObservation`
+and sanitized `DescriptorInventory` values before invoking these callbacks.
+The host must not import or construct plugin classes.
+
 The adapter is explicitly started. A disabled configuration never inspects the
 binding, opens a destination, starts a thread, or registers callbacks. A
 contract mismatch, invalid destination, or registration failure aborts before
@@ -28,6 +33,19 @@ After activation, callback, normalizer, serialization, filesystem, descriptor,
 unregistration, and cleanup failures are contained and counted. `stop()` first
 makes callbacks inert, then unregisters and closes plugin-owned resources.
 Repeated start/stop calls do not create duplicate registration or cleanup.
+
+Activation errors have stable subclasses of `AdapterActivationError`:
+`AdapterContractError` for an unreadable or incompatible contract,
+`AdapterResourceError` for resource initialization, and
+`AdapterRegistrationError` for registration failure or a null handle. The
+original exception is retained as `__cause__` when one was raised. Failed
+initialization and failed registration both attempt to close every prepared
+resource, even when another resource's cleanup raises.
+
+`cleanup_errors` counts exceptions during resource closure. `shutdown_timeouts`
+counts only a sink writer that did not terminate within the timeout. Background
+write failures remain in the sink's `io_errors`; successful shutdown does not
+imply successful delivery of every record.
 
 This interface does not prove that a current host implements the proposed
 contract. See [`current_host_seam_proposal.md`](current_host_seam_proposal.md)
@@ -61,11 +79,19 @@ for preconfiguration and performs no I/O.
 
 ## Current validation level
 
+The filesystem test matrix is Linux/POSIX, using directory file descriptors,
+no-follow opens, file locks and POSIX permission bits. Native Windows is not a
+validated sink/descriptor platform. WSL validation must use a native Linux
+filesystem such as ext4. Host-independent tests can run separately; a skipped
+filesystem test is not Windows compatibility evidence.
+
 Fixture and CPU tests cover disabled zero-work behavior, contract and
 destination rejection, registration failure cleanup, exact transfer/recovery/
 first-compute normalization, optional descriptor support, invalid source data,
 callback exceptions, duplicate start/stop, callback races during registration,
-unregistration failure, and thread/resource cleanup.
+unregistration failure, and thread/resource cleanup. Failure-injection tests
+also check initialization cause preservation, cleanup after multiple errors,
+and the distinction between write failures, close exceptions and timeouts.
 
 The manifest remains `import_only`. A real source-specific binding, accepted
 host seam, fixed compatibility matrix, clean enable/disable integration, and

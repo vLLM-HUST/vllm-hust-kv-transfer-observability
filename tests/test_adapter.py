@@ -1,12 +1,17 @@
 import json
 import threading
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
+import vllm_hust_kv_transfer_observability.adapter as adapter_module
 from vllm_hust_kv_transfer_observability import (
     HOST_OBSERVER_CONTRACT,
     AdapterActivationError,
+    AdapterContractError,
+    AdapterRegistrationError,
+    AdapterResourceError,
     AdapterState,
     ComputeKind,
     CoreRecoveryAdmitted,
@@ -27,6 +32,23 @@ from vllm_hust_kv_transfer_observability import (
 )
 
 PROCESS_UUID = "e" * 32
+
+
+@pytest.fixture
+def resources(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mock]:
+    """Exercise activation failures without depending on POSIX destinations."""
+    normalizer, sink, capture = Mock(), Mock(), Mock()
+    sink.close.return_value = True
+    monkeypatch.setattr(
+        adapter_module, "LifecycleNormalizer", Mock(return_value=normalizer)
+    )
+    monkeypatch.setattr(
+        adapter_module, "JsonlKVTransferEventSink", Mock(return_value=sink)
+    )
+    monkeypatch.setattr(
+        adapter_module, "DescriptorLayoutCapture", Mock(return_value=capture)
+    )
+    return normalizer, sink, capture
 
 
 class FakeBinding:
@@ -143,7 +165,7 @@ def test_contract_mismatch_fails_before_destinations_or_registration(
     binding = FakeBinding(contract_version="vllm.kv-transfer.observer.v2")
     adapter = KVTransferHostAdapter(enabled_config(tmp_path))
 
-    with pytest.raises(AdapterActivationError, match=HOST_OBSERVER_CONTRACT):
+    with pytest.raises(AdapterContractError):
         adapter.start(binding)
     assert binding.register_calls == 0
     assert adapter.state is AdapterState.STOPPED
@@ -157,24 +179,152 @@ def test_invalid_destination_fails_before_host_registration(tmp_path: Path) -> N
     )
     binding = FakeBinding()
 
-    with pytest.raises(AdapterActivationError, match="destinations"):
+    with pytest.raises(AdapterResourceError):
         adapter.start(binding)
     assert binding.register_calls == 0
     assert adapter.state is AdapterState.STOPPED
 
 
-def test_registration_failure_closes_prepared_resources(tmp_path: Path) -> None:
-    adapter = KVTransferHostAdapter(enabled_config(tmp_path))
+def test_registration_failure_closes_prepared_resources(
+    tmp_path: Path, resources: tuple[Mock, Mock, Mock]
+) -> None:
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
     binding = FakeBinding(registration_error=RuntimeError("unavailable"))
 
-    with pytest.raises(AdapterActivationError, match="registration"):
+    with pytest.raises(AdapterRegistrationError) as error:
         adapter.start(binding)
+    assert isinstance(error.value, AdapterActivationError)
+    assert error.value.__cause__ is binding.registration_error
     assert adapter.state is AdapterState.STOPPED
     assert binding.register_calls == 1
+    for resource in resources:
+        resource.close.assert_called_once()
+
+
+def test_contract_inspection_failure_keeps_original_cause(tmp_path: Path) -> None:
+    cause = RuntimeError("contract unavailable")
+
+    class UnreadableBinding:
+        @property
+        def contract_version(self) -> str:
+            raise cause
+
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path))
+    with pytest.raises(AdapterContractError) as error:
+        adapter.start(UnreadableBinding())  # type: ignore[arg-type]
+    assert error.value.__cause__ is cause
+    assert adapter.state is AdapterState.STOPPED
+
+
+@pytest.mark.parametrize("failed_resource", ["sink", "capture"])
+def test_initialization_cleanup_preserves_cause_and_closes_remaining_resources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resources: tuple[Mock, Mock, Mock],
+    failed_resource: str,
+) -> None:
+    normalizer, sink, capture = resources
+    cause = OSError("initial destination failure")
+    normalizer.close.side_effect = RuntimeError("normalizer cleanup failure")
+    sink.close.side_effect = OSError("sink cleanup failure")
+    factory = (
+        "JsonlKVTransferEventSink"
+        if failed_resource == "sink"
+        else "DescriptorLayoutCapture"
+    )
+    monkeypatch.setattr(adapter_module, factory, Mock(side_effect=cause))
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
+    binding = FakeBinding()
+
+    with pytest.raises(AdapterResourceError) as error:
+        adapter.start(binding)
+    assert error.value.__cause__ is cause
+    assert adapter.state is AdapterState.STOPPED
+    assert binding.register_calls == 0
+    normalizer.close.assert_called_once()
+    capture.close.assert_not_called()
+    if failed_resource == "sink":
+        sink.close.assert_not_called()
+        assert adapter.counters.cleanup_errors == 1
+    else:
+        sink.close.assert_called_once()
+        assert adapter.counters.cleanup_errors == 2
+    assert adapter.counters.shutdown_timeouts == 0
+
+
+def test_registration_error_survives_multiple_cleanup_errors(
+    tmp_path: Path, resources: tuple[Mock, Mock, Mock]
+) -> None:
+    for resource in resources:
+        resource.close.side_effect = OSError("cleanup failed")
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
+    binding = FakeBinding(registration_error=RuntimeError("registration failed"))
+    with pytest.raises(AdapterRegistrationError) as error:
+        adapter.start(binding)
+    assert error.value.__cause__ is binding.registration_error
+    for resource in resources:
+        resource.close.assert_called_once()
+    assert adapter.counters.cleanup_errors == 3
+    assert adapter.counters.shutdown_timeouts == 0
+    assert adapter.state is AdapterState.STOPPED
+
+
+@pytest.mark.parametrize("close_result", [True, False, OSError("close failed")])
+def test_shutdown_counts_timeout_and_cleanup_error_separately(
+    tmp_path: Path, resources: tuple[Mock, Mock, Mock], close_result: bool | Exception
+) -> None:
+    _, sink, _ = resources
+    if isinstance(close_result, Exception):
+        sink.close.side_effect = close_result
+    else:
+        sink.close.return_value = close_result
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path))
+    binding = FakeBinding()
+    assert adapter.start(binding)
+    assert adapter.stop() is (close_result is True)
+    assert adapter.counters.cleanup_errors == int(isinstance(close_result, Exception))
+    assert adapter.counters.shutdown_timeouts == int(close_result is False)
+    assert binding.unregister_calls == 1
+    assert adapter.state is AdapterState.STOPPED
+    assert adapter.stop()
+    sink.close.assert_called_once()
+
+
+def test_partial_initialization_failure_stops_real_sink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    normalizer = adapter_module.LifecycleNormalizer()
+    normalizer.close = Mock(side_effect=RuntimeError("cleanup failed"))
+    monkeypatch.setattr(adapter_module, "LifecycleNormalizer", lambda **_: normalizer)
+    cause = OSError("descriptor initialization failed")
+    monkeypatch.setattr(
+        adapter_module, "DescriptorLayoutCapture", Mock(side_effect=cause)
+    )
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
+    with pytest.raises(AdapterResourceError) as error:
+        adapter.start(FakeBinding())
+    assert error.value.__cause__ is cause
+    assert adapter.counters.cleanup_errors == 1
     assert not any(
         thread.name == "kv-transfer-jsonl-sink" and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_writer_io_failure_is_not_a_shutdown_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path))
+    assert adapter.start(FakeBinding())
+    sink = adapter._sink
+    assert sink is not None
+    monkeypatch.setattr(sink, "_write_record", Mock(side_effect=OSError("disk full")))
+    assert adapter.observe(submitted())
+    assert sink.flush()
+    assert adapter.stop()
+    assert sink.counters.io_errors == 1
+    assert adapter.counters.shutdown_timeouts == 0
+    assert adapter.counters.cleanup_errors == 0
 
 
 def test_callback_before_registration_completes_is_dropped(tmp_path: Path) -> None:
