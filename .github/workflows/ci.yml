@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+env:
+  EXTENSION_MANAGER_SPEC: "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@9fb467447e95d753f7002b28575d6802f4347181"
+
 jobs:
   package:
     strategy:
@@ -16,10 +22,35 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
+      - run: python -m pip install "$EXTENSION_MANAGER_SPEC"
       - run: python -m pip install -e ".[test]" build
       - run: ruff check .
       - run: ruff format --check .
       - run: pytest -q
       - run: python -m build
       - run: vllm-hust-ext extension inspect org.vllm-hust.kv-transfer-observability
+      - name: Validate installed wheel in an isolated environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/kv-wheel-env"
+          wheel_python="$RUNNER_TEMP/kv-wheel-env/bin/python"
+          wheel_cli="$RUNNER_TEMP/kv-wheel-env/bin/vllm-hust-ext"
+          "$wheel_python" -m pip install "$EXTENSION_MANAGER_SPEC" pytest dist/*.whl
+          cd "$RUNNER_TEMP"
+          env -u PYTHONPATH "$wheel_python" -m pytest "$GITHUB_WORKSPACE/tests" -q
+          "$wheel_cli" extension inspect org.vllm-hust.kv-transfer-observability
+          "$wheel_cli" extension check org.vllm-hust.kv-transfer-observability
+          "$wheel_python" - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          cli = pathlib.Path(sys.executable).with_name("vllm-hust-ext")
+          result = subprocess.run(
+              [str(cli), "extension", "enable", "org.vllm-hust.kv-transfer-observability"],
+              text=True, capture_output=True,
+          )
+          assert result.returncode == 2, result
+          assert "import_only" in result.stderr, result.stderr
+          print("enable rejected as expected: import_only")
+          PY

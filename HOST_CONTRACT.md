@@ -26,11 +26,13 @@ consumers join them on request identity:
 - **Scheduler-layer transitions** (preemption, resume, admission, scheduled) are
   owned by the host's process-local typed event bus work, not by this package's
   host seam. Status: `vLLM-HUST/vllm-hust#6` proposes a default-off typed bus and
-  today exposes only `RequestPreempted` and `RequestFinished`. The resume-side
+  in its unmerged proposal exposes only `RequestPreempted` and `RequestFinished`.
+  This is not a claim that current host `main` implements the bus. The resume-side
   events are proposed, not implemented, and must not be read as available.
 - **KV-transfer-layer records** (transfer submit/completion/cancellation, recovery
   requeue/admission, first-compute receipt) are owned by this package's host seam
-  and already exist as canonical typed records in `main`.
+  and already exist as canonical typed records in plugin `main`; the host call
+  sites and real event production are not implemented by those records.
 - Neither layer may be implemented as a third competing event bus, and no host
   seam may require the host to import plugin classes.
 

@@ -9,18 +9,20 @@
 ## 〇、状态更新（PR #5 合并后，2026-09-18）
 
 本报告写于抽取基线 `70d1fdc`。PR #5（`feature/issue2-host-integration`，合并为
-`ec3446d`）落地后，下列缺口已在 `main` 上闭合，本 PR 因此**不再重复添加对应实现或契约文本**：
+`ec3446d`）落地后，下表区分已闭合与仍待接入的缺口，本 PR 因此**不再重复添加对应实现**：
 
 | 本报告缺口 | 当前状态（main @ ec3446d） |
 |---|---|
 | 2.1 6-event 恢复链词表未定义 | `b134.py` 固化 legacy 事件契约，逐事件标注归属（4 个 `B134Owner.SCHEDULER` + 10 个 `B134Owner.KV_OFFLOAD`），`B134_EVENT_COUNT = 14`、`UNIFIED_SOURCE_EVENT_COUNT_WITH_FIRST_COMPUTE = 15`。**顺序契约与 log_stats 解耦仍属宿主侧义务**，写入 `HOST_CONTRACT.md` |
 | 2.2 transfer 双时间语义丢失 | 已保留：canonical schema 分开承载 `observed_at_ns`、宿主墙钟 `duration_ns`、设备 `device_duration_ns`（`schema.py`） |
 | 2.3 descriptor region 标识被删 | 已收敛：`descriptors.py` 的 v2 inventory 定义了 bounded numeric region ID，本节提出的"补 region 字段"决策按 v2 落地，不再扩展 v1 schema |
-| 2.4 禁用时零开销未契约化 | 插件侧由关闭式配置承担；**宿主侧"无 observer 时不读时钟/不构 payload"仍是未实现义务**，写入 `HOST_CONTRACT.md` |
+| 2.4 禁用时零开销未契约化 | `main @ ec3446d` 已有 sink 无目标路径时的禁用行为；adapter 关闭式配置属于独立 PR #6，不计入此处 main 的完成项。**宿主侧"无 observer 时不读时钟/不构 payload"仍是未实现义务**，写入 `HOST_CONTRACT.md` |
 | 2.5 纯语义测试 0 迁移 | 已迁移：`test_schema.py`、`test_normalization.py`、`test_descriptors.py`、`test_event_sink.py` 均在 `main` |
 | identity 字段（第 4 节建议） | 已实现：`ObservationIdentity` / `TransferIdentity` / `ReceiptIdentity` 定义分离且有界字段（含 worker generation、rank、recovery epoch），`request_id` 不再承载 transfer job |
 
-以下各节保留为抽取基线的历史记录。
+以下各节保留为抽取基线的历史记录，不构成当前验收或新增审批要求。
+其中地址拒绝的旧结论仅来自当时有限的测试；完整的 closed-field 校验
+是 PR #5 引入 typed schema 后才实现的，不能由旧的字段名检查推导。
 
 ## 一、保留 ✓
 
