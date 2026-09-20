@@ -1,5 +1,17 @@
 """KV transfer observability primitives and an inert activation descriptor."""
 
+from .adapter import (
+    HOST_OBSERVER_CONTRACT,
+    AdapterActivationError,
+    AdapterContractError,
+    AdapterCounters,
+    AdapterRegistrationError,
+    AdapterResourceError,
+    AdapterState,
+    HostObserverBinding,
+    HostObserverCallbacks,
+    KVTransferHostAdapter,
+)
 from .b134 import (
     B134_EVENT_CONTRACTS,
     B134_EVENT_COUNT,
@@ -11,6 +23,12 @@ from .b134 import (
     B134Owner,
     b134_event_contract,
 )
+from .config import (
+    DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    MAX_SHUTDOWN_TIMEOUT_SECONDS,
+    ConfigurationError,
+    ObserverConfig,
+)
 from .descriptors import (
     ALLOWED_EVIDENCE_LABELS,
     DescriptorCaptureCounters,
@@ -19,7 +37,7 @@ from .descriptors import (
     DescriptorRegion,
     EvidenceLabel,
 )
-from .events import EventSinkCounters, JsonlKVTransferEventSink
+from .events import MIN_RECORD_BYTES, EventSinkCounters, JsonlKVTransferEventSink
 from .normalization import (
     CoreRecoveryAdmitted,
     CoreRecoveryRequeued,
@@ -51,6 +69,13 @@ class VllmHustKvTransferObservabilityContractProposal:
 
 __all__ = [
     "ALLOWED_EVIDENCE_LABELS",
+    "HOST_OBSERVER_CONTRACT",
+    "AdapterActivationError",
+    "AdapterContractError",
+    "AdapterCounters",
+    "AdapterRegistrationError",
+    "AdapterResourceError",
+    "AdapterState",
     "B134_EVENT_CONTRACTS",
     "B134_EVENT_COUNT",
     "B134_RECOVERY_CHAIN",
@@ -60,6 +85,7 @@ __all__ = [
     "B134IdentityKind",
     "B134Owner",
     "ComputeKind",
+    "ConfigurationError",
     "CoreRecoveryAdmitted",
     "CoreRecoveryRequeued",
     "CoreTransferCancelled",
@@ -69,15 +95,21 @@ __all__ = [
     "DescriptorInventory",
     "DescriptorLayoutCapture",
     "DescriptorRegion",
+    "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS",
     "EventSinkCounters",
     "EvidenceLabel",
     "FirstComputeObserved",
+    "HostObserverBinding",
+    "HostObserverCallbacks",
     "JsonlKVTransferEventSink",
     "KVTransferObservation",
     "LifecycleNormalizer",
+    "MAX_SHUTDOWN_TIMEOUT_SECONDS",
+    "MIN_RECORD_BYTES",
     "NormalizationCounters",
     "ObservationEvent",
     "ObservationIdentity",
+    "ObserverConfig",
     "ReceiptIdentity",
     "RecoveryRequeueReason",
     "SourceHost",
@@ -85,6 +117,7 @@ __all__ = [
     "TransferIdentity",
     "TransferOperation",
     "TransferTerminalReason",
+    "KVTransferHostAdapter",
     "VllmHustKvTransferObservabilityContractProposal",
     "b134_event_contract",
 ]

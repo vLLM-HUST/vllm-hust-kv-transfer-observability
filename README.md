@@ -86,6 +86,11 @@ the exact legacy B134 vocabulary and its lossless canonical correspondences are
 also recorded without accepting arbitrary event strings. See
 [`docs/normalization.md`](docs/normalization.md).
 
+The plugin-side binding lifecycle and closed configuration schema are described
+in [`docs/plugin_adapter.md`](docs/plugin_adapter.md). They are fixture-tested
+against the proposed contract but do not constitute current-host attachment;
+the package remains `import_only`.
+
 The semantic audit of the extracted package against the legacy B134 patches —
 what was preserved, what was dropped, and what was an intentional design change —
 is recorded in [`docs/semantic-audit.md`](docs/semantic-audit.md).
