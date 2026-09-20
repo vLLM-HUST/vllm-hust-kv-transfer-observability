@@ -20,12 +20,21 @@ tested, but Extension Manager must refuse enablement until explicit observer
 registration, configuration, and compatibility evidence land.
 
 ```bash
-python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
+python -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@9fb467447e95d753f7002b28575d6802f4347181"
 python -m pip install -e ".[test]"
 vllm-hust-ext extension inspect org.vllm-hust.kv-transfer-observability
 vllm-hust-ext extension check org.vllm-hust.kv-transfer-observability
 pytest -q
 ```
+
+The filesystem validation matrix is Linux/POSIX with Python 3.10, 3.12 and
+3.14. Sink and descriptor tests require POSIX directory descriptors, no-follow
+opens and permission semantics; native Windows is not a supported filesystem
+test target. For WSL, use a native Linux filesystem such as ext4.
+CI validates both the source checkout and a separately installed wheel,
+including Extension Manager discovery/check and expected `import_only`
+enable rejection. Its Extension Manager dependency is pinned to the revision
+in the installation command above.
 
 The static Manifest 0.2 descriptor lives inside the Python distribution under
 `src/`. Installation alone changes no vLLM behavior.
@@ -76,3 +85,7 @@ semantics into the same canonical records. It remains detached from any host;
 the exact legacy B134 vocabulary and its lossless canonical correspondences are
 also recorded without accepting arbitrary event strings. See
 [`docs/normalization.md`](docs/normalization.md).
+
+The semantic audit of the extracted package against the legacy B134 patches —
+what was preserved, what was dropped, and what was an intentional design change —
+is recorded in [`docs/semantic-audit.md`](docs/semantic-audit.md).
