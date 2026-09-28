@@ -248,6 +248,10 @@ class JsonlKVTransferEventSink:
             time.sleep(0.002)
         return True
 
+    @property
+    def is_alive(self) -> bool:
+        return self._worker is not None and self._worker.is_alive()
+
     def close(self, timeout: float = 5.0) -> bool:
         if (
             type(timeout) not in {int, float}

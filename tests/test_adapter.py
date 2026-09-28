@@ -46,7 +46,7 @@ def resources(monkeypatch: pytest.MonkeyPatch) -> tuple[Mock, Mock, Mock]:
         adapter_module, "JsonlKVTransferEventSink", Mock(return_value=sink)
     )
     monkeypatch.setattr(
-        adapter_module, "DescriptorLayoutCapture", Mock(return_value=capture)
+        adapter_module, "AsyncDescriptorLayoutCapture", Mock(return_value=capture)
     )
     return normalizer, sink, capture
 
@@ -230,7 +230,7 @@ def test_initialization_cleanup_preserves_cause_and_closes_remaining_resources(
     factory = (
         "JsonlKVTransferEventSink"
         if failed_resource == "sink"
-        else "DescriptorLayoutCapture"
+        else "AsyncDescriptorLayoutCapture"
     )
     monkeypatch.setattr(adapter_module, factory, Mock(side_effect=cause))
     adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
@@ -298,7 +298,7 @@ def test_partial_initialization_failure_stops_real_sink(
     monkeypatch.setattr(adapter_module, "LifecycleNormalizer", lambda **_: normalizer)
     cause = OSError("descriptor initialization failed")
     monkeypatch.setattr(
-        adapter_module, "DescriptorLayoutCapture", Mock(side_effect=cause)
+        adapter_module, "AsyncDescriptorLayoutCapture", Mock(side_effect=cause)
     )
     adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
     with pytest.raises(AdapterResourceError) as error:
@@ -500,8 +500,8 @@ def test_cleanup_exception_is_contained_and_other_resources_close(
     assert adapter._descriptor_capture is not None
     real_close = adapter._descriptor_capture.close
 
-    def close_then_fail() -> None:
-        real_close()
+    def close_then_fail(timeout=5.0) -> None:
+        real_close(timeout)
         raise RuntimeError("capture cleanup failed")
 
     monkeypatch.setattr(adapter._descriptor_capture, "close", close_then_fail)
@@ -512,3 +512,63 @@ def test_cleanup_exception_is_contained_and_other_resources_close(
         thread.name == "kv-transfer-jsonl-sink" and thread.is_alive()
         for thread in threading.enumerate()
     )
+
+
+def test_descriptor_timeout_retains_ownership_and_can_be_retried(tmp_path, monkeypatch):
+    from dataclasses import replace
+
+    binding = FakeBinding()
+    adapter = KVTransferHostAdapter(
+        replace(
+            enabled_config(tmp_path, descriptors=True), shutdown_timeout_seconds=0.01
+        )
+    )
+    assert adapter.start(binding)
+    capture = adapter._descriptor_capture
+    assert capture is not None
+    entered, release = threading.Event(), threading.Event()
+    original = capture._capture.capture
+
+    def stall(record):
+        entered.set()
+        assert release.wait(5)
+        return original(record)
+
+    monkeypatch.setattr(capture._capture, "capture", stall)
+    try:
+        assert adapter.capture_descriptor(descriptor())
+        assert entered.wait(2)
+        assert adapter.counters.descriptors_queued == 1
+        assert adapter.counters.descriptors_written == 0
+        assert not adapter.stop()
+        assert adapter.state is AdapterState.STOPPING
+        assert not adapter.start(binding)
+        assert not adapter.capture_descriptor(descriptor())
+    finally:
+        release.set()
+        assert capture.close(5)
+        assert adapter._sink.close(5)
+        assert adapter.stop()
+    assert adapter.state is AdapterState.STOPPED
+    assert adapter.counters.descriptors_written == 1
+    assert adapter.counters.shutdown_timeouts >= 1
+    assert binding.unregister_calls == 1
+    assert capture._capture._directory_fd == -1
+
+
+def test_descriptor_background_failure_is_not_reported_as_written(
+    tmp_path, monkeypatch
+):
+    adapter = KVTransferHostAdapter(enabled_config(tmp_path, descriptors=True))
+    assert adapter.start(FakeBinding())
+    capture = adapter._descriptor_capture
+    assert capture is not None
+    monkeypatch.setattr(
+        capture._capture, "capture", Mock(side_effect=OSError("disk full"))
+    )
+    assert adapter.capture_descriptor(descriptor())
+    assert adapter.stop()
+    assert adapter.counters.descriptors_queued == 1
+    assert adapter.counters.descriptors_written == 0
+    assert adapter.counters.descriptors_dropped == 1
+    assert adapter.counters.shutdown_timeouts == 0
