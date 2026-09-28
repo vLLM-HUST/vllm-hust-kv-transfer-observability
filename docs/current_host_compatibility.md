@@ -42,6 +42,19 @@ local fake aliases or by suppressing ImportError.
   does not validate all Ascend requirements, native extensions or CANN.
 - The dedicated plugin development environment has none of torch, torch-npu,
   vLLM or Ascend installed. No real host import or device test was run there.
+- In a separate Python 3.12/aarch64 environment, the CPU-index builds of
+  `torch==2.13.0`, `torchvision==0.28.0`, and `torchaudio==2.11.0`, plus
+  `torch-npu==2.13.0rc1`, installed and imported successfully. Package metadata
+  checks passed and `torch_npu.npu.is_initialized()` remained false. This
+  tests only those packages, not the vLLM worker, native Ascend ops or hardware.
+- Full dependency resolution of core `requirements/common.txt` and Ascend
+  `requirements.txt` did not succeed: `triton-ascend==3.6.0` was unavailable
+  from the checked default index, Huawei Ascend index and documented
+  `triton-ascend/` find-links page. No alternate version was substituted.
+- The selected Ascend Dockerfiles default to CANN 9.1.0; the local runtime
+  installation is CANN 9.0.0. Successful TorchNPU import does not establish
+  that this CANN combination supports the selected full Ascend tree. The
+  system toolkit was not changed.
 - The locally built plugin wheel was installed outside the checkout with
   Manager `701aa95ae8d5b23b5ea8c8ec475ceaa470393e54` in a clean Python 3.12
   environment: 143 plugin tests passed. `inspect` discovers the bundle,
@@ -67,6 +80,10 @@ uv pip install --dry-run --python .venv/bin/python --index-url https://pypi.org/
 
 1. Prepare an isolated full runtime environment from a coherent source pair,
    verify all dependencies/CANN and import the real worker/runner/connector.
+   First resolve the unavailable pinned Triton Ascend package and the CANN
+   version difference above, using documented artifacts rather than silently
+   relaxing pins. The current isolated environment is dependency preflight,
+   not an installed or supported runtime.
    If delivering on organization core, resolve its divergence from the Ascend
    marker before calling the combination supported.
 2. Implement the minimal KV outlet tracked by
