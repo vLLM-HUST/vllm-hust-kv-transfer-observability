@@ -43,9 +43,26 @@ initialization and failed registration both attempt to close every prepared
 resource, even when another resource's cleanup raises.
 
 `cleanup_errors` counts exceptions during resource closure. `shutdown_timeouts`
-counts only a sink writer that did not terminate within the timeout. Background
+counts writers that did not terminate within the shared shutdown time budget. Background
 write failures remain in the sink's `io_errors`; successful shutdown does not
 imply successful delivery of every record.
+
+Descriptor callbacks now enqueue into `AsyncDescriptorLayoutCapture`; `True`
+means accepted, not written. The queue retains at most `max_pending_descriptors`
+immutable, schema-bounded inventories plus one in flight and drops the newest
+arrival when full. Serialization, file publication and fsync run on its private
+writer; the synchronous `DescriptorLayoutCapture` remains a lower-level utility
+for non-hot-path use. `descriptors_queued` counts acceptance,
+`descriptors_written` counts completed publication, and `descriptors_dropped`
+includes rejected admissions and asynchronous publication failures. These
+counts need not balance while work is in flight, but do after a successful drain.
+
+Close stops new admissions and drains accepted work within the timeout. If I/O
+is still blocked, the writer retains its directory descriptor and closes it
+when that I/O returns. The adapter remains `STOPPING`, rejects restart, and
+allows `stop()` to retry; this is not a successful unload. Python cannot cancel
+an in-flight filesystem syscall safely. Write failure is counted separately
+from timeout, and successful closure does not imply successful publication.
 
 This interface does not prove that a current host implements the proposed
 contract. See [`current_host_seam_proposal.md`](current_host_seam_proposal.md)
@@ -69,6 +86,7 @@ configuration without an event destination are rejected.
 | `max_correlated_transfers` | `4096` | `1..4096` |
 | `max_recovery_admissions` | `4096` | `1..4096` |
 | `max_descriptor_regions` | `4096` | `1..4096` |
+| `max_pending_descriptors` | `16` | `1..16`, plus at most one in-flight inventory |
 | `max_descriptor_record_bytes` | `1048576` | `1..1048576` |
 | `shutdown_timeout_seconds` | `5.0` | finite `0..30` seconds |
 

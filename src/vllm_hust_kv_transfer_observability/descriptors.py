@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import secrets
 import stat
 import threading
 import time
+from collections import deque
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from enum import Enum
@@ -25,6 +28,7 @@ from .schema import (
 
 MAX_DESCRIPTOR_REGIONS: Final = 4096
 DEFAULT_MAX_DESCRIPTOR_RECORD_BYTES: Final = 1024 * 1024
+DEFAULT_MAX_PENDING_DESCRIPTORS: Final = 16
 
 
 class EvidenceLabel(str, Enum):
@@ -320,9 +324,150 @@ class DescriptorLayoutCapture:
         self.close()
 
 
+@dataclass(frozen=True, slots=True)
+class AsyncDescriptorCounters:
+    accepted: int = 0
+    queue_full: int = 0
+    invalid_records: int = 0
+    closed_dropped: int = 0
+    written: int = 0
+    failed: int = 0
+    cleanup_errors: int = 0
+    result_callback_errors: int = 0
+
+
+class AsyncDescriptorLayoutCapture:
+    """Bounded descriptor admission; only the writer performs serialization/I/O.
+
+    The queue retains at most ``max_pending`` immutable inventories plus one
+    in flight. Each inventory has the schema's region and scalar bounds.
+    ``capture`` returning True means queued, not published. A timed-out close
+    leaves ownership with the writer, which closes the directory after I/O
+    returns; it never closes a descriptor underneath an in-flight write.
+    """
+
+    def __init__(
+        self,
+        capture_dir: str | Path,
+        evidence_label: str | EvidenceLabel,
+        *,
+        max_pending: int = DEFAULT_MAX_PENDING_DESCRIPTORS,
+        max_regions: int = MAX_DESCRIPTOR_REGIONS,
+        max_record_bytes: int = DEFAULT_MAX_DESCRIPTOR_RECORD_BYTES,
+        on_result: Callable[[bool], None] | None = None,
+    ) -> None:
+        if type(max_pending) is not int or not (
+            1 <= max_pending <= DEFAULT_MAX_PENDING_DESCRIPTORS
+        ):
+            raise ValueError("max_pending exceeds descriptor queue bounds")
+        self._capture = DescriptorLayoutCapture(
+            capture_dir,
+            evidence_label,
+            max_regions=max_regions,
+            max_record_bytes=max_record_bytes,
+        )
+        self._max_pending = max_pending
+        self._max_regions = max_regions
+        self._on_result = on_result
+        self._condition = threading.Condition()
+        self._queue: deque[DescriptorInventory] = deque()
+        self._closing = False
+        self._counts = {name: 0 for name in AsyncDescriptorCounters.__slots__}
+        self._writer = threading.Thread(
+            target=self._run, name="kv-transfer-descriptor-writer", daemon=True
+        )
+        try:
+            self._writer.start()
+        except Exception:
+            self._capture.close()
+            raise
+
+    @property
+    def counters(self) -> AsyncDescriptorCounters:
+        with self._condition:
+            return AsyncDescriptorCounters(**self._counts)
+
+    @property
+    def publication_counters(self) -> DescriptorCaptureCounters:
+        return self._capture.counters
+
+    @property
+    def is_alive(self) -> bool:
+        return self._writer.is_alive()
+
+    def capture(self, inventory: DescriptorInventory) -> bool:
+        """Drop newest on overflow; never serialize or touch the filesystem."""
+        with self._condition:
+            if self._closing:
+                self._counts["closed_dropped"] += 1
+                return False
+            if (
+                type(inventory) is not DescriptorInventory
+                or len(inventory.regions) > self._max_regions
+            ):
+                self._counts["invalid_records"] += 1
+                return False
+            if len(self._queue) >= self._max_pending:
+                self._counts["queue_full"] += 1
+                return False
+            self._queue.append(inventory)
+            self._counts["accepted"] += 1
+            self._condition.notify()
+            return True
+
+    def _run(self) -> None:
+        try:
+            while True:
+                with self._condition:
+                    while not self._queue and not self._closing:
+                        self._condition.wait()
+                    if not self._queue:
+                        return
+                    inventory = self._queue.popleft()
+                try:
+                    written = self._capture.capture(inventory) is not None
+                except Exception:
+                    written = False
+                with self._condition:
+                    self._counts["written" if written else "failed"] += 1
+                if self._on_result is not None:
+                    try:
+                        self._on_result(written)
+                    except Exception:
+                        with self._condition:
+                            self._counts["result_callback_errors"] += 1
+        finally:
+            try:
+                self._capture.close()
+            except Exception:
+                with self._condition:
+                    self._counts["cleanup_errors"] += 1
+
+    def close(self, timeout: float = 5.0) -> bool:
+        """Stop admission and drain within timeout; callable again after timeout."""
+        if (
+            type(timeout) not in {int, float}
+            or not math.isfinite(timeout)
+            or timeout < 0
+        ):
+            raise ValueError("timeout must be a non-negative number")
+        with self._condition:
+            self._closing = True
+            self._condition.notify_all()
+        self._writer.join(timeout)
+        if self._writer.is_alive():
+            return False
+        if self.counters.cleanup_errors:
+            raise OSError("descriptor writer cleanup failed")
+        return True
+
+
 __all__ = [
     "ALLOWED_EVIDENCE_LABELS",
     "DEFAULT_MAX_DESCRIPTOR_RECORD_BYTES",
+    "DEFAULT_MAX_PENDING_DESCRIPTORS",
+    "AsyncDescriptorCounters",
+    "AsyncDescriptorLayoutCapture",
     "DescriptorCaptureCounters",
     "DescriptorInventory",
     "DescriptorLayoutCapture",
