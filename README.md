@@ -94,3 +94,37 @@ the package remains `import_only`.
 The semantic audit of the extracted package against the legacy B134 patches —
 what was preserved, what was dropped, and what was an intentional design change —
 is recorded in [`docs/semantic-audit.md`](docs/semantic-audit.md).
+
+## Compatibility and validation level
+
+The exact combinations CI verifies, and everything the manifest declares but that
+has never been exercised, are kept apart in
+[`docs/compatibility.md`](docs/compatibility.md). Only the verified table is
+evidence.
+
+## Uninstall
+
+```bash
+python -m pip uninstall vllm-hust-kv-transfer-observability
+```
+
+The distribution registers exactly one entry point, in the Extension Manager
+discovery group `vllm_hust.extension_bundles`. It registers no vLLM runtime hook,
+no daemon, no file watcher and no service, so uninstalling removes the descriptor
+with the distribution and there is no rollback step. Files that an explicitly
+enabled sink or capture already wrote stay on disk; remove them yourself. The
+package never deletes records it did not write in the current process.
+
+## Enable and disable
+
+`vllm-hust-ext extension enable org.vllm-hust.kv-transfer-observability` is
+refused with exit code 2 and `implementation status: import_only`. CI asserts
+both on every run, because `activation.entry_points` is empty and every
+`implementation[].status` is `import_only` in the manifest.
+
+Observation is opt-in and inert until a caller supplies a destination. Nothing in
+the serving process has to be stopped to turn observation off: it means not
+registering an observer, or unregistering the handle the host returned. The
+bounds, counters and failure policy of that opt-in path are in
+[`docs/observation_core.md`](docs/observation_core.md) and
+[`docs/plugin_adapter.md`](docs/plugin_adapter.md).
