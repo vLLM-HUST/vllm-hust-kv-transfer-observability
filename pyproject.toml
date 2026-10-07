@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vllm-hust-kv-transfer-observability"
-version = "0.1.0.dev0"
-description = "vllm-hust-kv-transfer-observability inert vLLM-HUST contract descriptor"
+version = "0.2.0.dev0"
+description = "Bounded KV transfer observer for the versioned vLLM-HUST host seam"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -16,6 +16,9 @@ test = ["pytest>=8", "ruff>=0.12", "vllm-hust-ext==0.2.0.dev0"]
 
 [project.entry-points."vllm_hust.extension_bundles"]
 "org.vllm-hust.kv-transfer-observability" = "vllm_hust_kv_transfer_observability"
+
+[project.entry-points."vllm.general_plugins"]
+kv_transfer_observability = "vllm_hust_kv_transfer_observability.plugin:register_plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/vllm_hust_kv_transfer_observability"]

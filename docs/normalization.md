@@ -88,10 +88,10 @@ observations to be counted and dropped.
 
 ## Remaining host-integration work
 
-- add the adapter-facing translation from exact current-host callback objects
-  only after verifying that those callbacks really exist.
+- retain fail-closed translation for scheduler recovery and descriptor records
+  until the host supplies sufficient cross-process identity and ordering.
 
-The B134 vocabulary is now reconciled and descriptor v2 uses bounded numeric
-source/destination region IDs derived from the legacy tensor index. Real host
-translation remains separate integration work and does not authorize changing
-the manifest from `import_only`.
+The B134 vocabulary is reconciled and descriptor v2 uses bounded numeric
+source/destination region IDs derived from the legacy tensor index. Manifest
+0.3 activates only the worker-local transfer subset that the current host can
+identify without inference; the other records continue to fail closed.

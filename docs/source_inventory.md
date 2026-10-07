@@ -1,5 +1,9 @@
 # Issue #2 source and integration inventory
 
+> Historical extraction inventory. Manifest 0.3 later activated the verified
+> worker-local transfer subset; broader recovery and descriptor items listed
+> here remain evidence or adaptation work.
+
 This document records the source-to-destination inventory for Issue #2. It
 captures observed repository facts, migration boundaries, implemented plugin
 components, and work that still requires real host or hardware evidence. It

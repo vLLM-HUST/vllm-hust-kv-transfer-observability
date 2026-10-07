@@ -92,5 +92,6 @@ conflict, I/O-error, and closed-drop counts.
   return value and counters. Filesystem loss, short writes, full queues,
   capacity exhaustion, conflicts, symlinks, and close races do not propagate
   into real KV transfer or serving. This is the runtime fail-open boundary.
-- The manifest remains `import_only`; none of this code registers a host
-  callback or activates on installation.
+- The schema and sink remain host-independent. Manifest 0.3 registers them only
+  through the explicit binding in `native.py`; importing this module alone does
+  not attach a callback or activate on installation.

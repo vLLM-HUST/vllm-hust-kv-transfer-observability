@@ -7,10 +7,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from threading import Lock
+from time import monotonic
 from typing import Protocol
 
 from .config import ObserverConfig
-from .descriptors import DescriptorInventory, DescriptorLayoutCapture
+from .descriptors import AsyncDescriptorLayoutCapture, DescriptorInventory
 from .events import JsonlKVTransferEventSink
 from .normalization import LifecycleNormalizer, SourceObservation
 
@@ -71,6 +72,7 @@ class AdapterCounters:
     normalization_dropped: int = 0
     sink_dropped: int = 0
     descriptors_received: int = 0
+    descriptors_queued: int = 0
     descriptors_written: int = 0
     descriptors_dropped: int = 0
     inactive_dropped: int = 0
@@ -100,7 +102,7 @@ class KVTransferHostAdapter:
         self._handle: object | None = None
         self._normalizer: LifecycleNormalizer | None = None
         self._sink: JsonlKVTransferEventSink | None = None
-        self._descriptor_capture: DescriptorLayoutCapture | None = None
+        self._descriptor_capture: AsyncDescriptorLayoutCapture | None = None
 
     @property
     def state(self) -> AdapterState:
@@ -121,14 +123,14 @@ class KVTransferHostAdapter:
     ) -> tuple[
         LifecycleNormalizer,
         JsonlKVTransferEventSink,
-        DescriptorLayoutCapture | None,
+        AsyncDescriptorLayoutCapture | None,
     ]:
         normalizer = LifecycleNormalizer(
             max_correlated_transfers=self.config.max_correlated_transfers,
             max_recovery_admissions=self.config.max_recovery_admissions,
         )
         sink: JsonlKVTransferEventSink | None = None
-        capture: DescriptorLayoutCapture | None = None
+        capture: AsyncDescriptorLayoutCapture | None = None
         try:
             sink = JsonlKVTransferEventSink(
                 self.config.event_path,
@@ -137,11 +139,13 @@ class KVTransferHostAdapter:
                 max_file_bytes=self.config.max_file_bytes,
             )
             if self.config.descriptor_dir is not None:
-                capture = DescriptorLayoutCapture(
+                capture = AsyncDescriptorLayoutCapture(
                     self.config.descriptor_dir,
                     self.config.evidence_label,
                     max_regions=self.config.max_descriptor_regions,
                     max_record_bytes=self.config.max_descriptor_record_bytes,
+                    max_pending=self.config.max_pending_descriptors,
+                    on_result=self._descriptor_result,
                 )
         except Exception:
             self._close_prepared_resources(normalizer, sink, capture)
@@ -208,9 +212,10 @@ class KVTransferHostAdapter:
         self,
         normalizer: LifecycleNormalizer,
         sink: JsonlKVTransferEventSink | None,
-        capture: DescriptorLayoutCapture | None,
+        capture: AsyncDescriptorLayoutCapture | None,
     ) -> bool:
         cleanup_ok = True
+        deadline = monotonic() + self.config.shutdown_timeout_seconds
         try:
             normalizer.close()
         except Exception:
@@ -218,14 +223,16 @@ class KVTransferHostAdapter:
             self._increment("cleanup_errors")
         if capture is not None:
             try:
-                capture.close()
+                if not capture.close(max(0.0, deadline - monotonic())):
+                    cleanup_ok = False
+                    self._increment("shutdown_timeouts")
             except Exception:
                 cleanup_ok = False
                 self._increment("cleanup_errors")
         if sink is None:
             return cleanup_ok
         try:
-            sink_ok = sink.close(self.config.shutdown_timeout_seconds)
+            sink_ok = sink.close(max(0.0, deadline - monotonic()))
         except Exception:
             self._increment("cleanup_errors")
             return False
@@ -262,7 +269,7 @@ class KVTransferHostAdapter:
         return True
 
     def capture_descriptor(self, inventory: DescriptorInventory) -> bool:
-        """Publish one already-sanitized inventory without raising."""
+        """Enqueue an immutable inventory; True does not promise publication."""
         with self._state_lock:
             if self._state is not AdapterState.ACTIVE:
                 self._counter_values["inactive_dropped"] += 1
@@ -277,9 +284,12 @@ class KVTransferHostAdapter:
         except Exception:
             self._increment("callback_errors")
             return False
-        counter = "descriptors_written" if output is not None else "descriptors_dropped"
+        counter = "descriptors_queued" if output else "descriptors_dropped"
         self._increment(counter)
-        return output is not None
+        return bool(output)
+
+    def _descriptor_result(self, written: bool) -> None:
+        self._increment("descriptors_written" if written else "descriptors_dropped")
 
     def stop(self) -> bool:
         """Become inert, unregister, and close owned resources idempotently."""
@@ -308,10 +318,17 @@ class KVTransferHostAdapter:
             with self._state_lock:
                 self._binding = None
                 self._handle = None
-                self._normalizer = None
-                self._sink = None
-                self._descriptor_capture = None
-                self._state = AdapterState.STOPPED
+                if (capture is not None and capture.is_alive is True) or (
+                    sink is not None and sink.is_alive is True
+                ):
+                    # Keep ownership for a retry; do not restart on a destination
+                    # whose prior writer is still in flight after a timeout.
+                    self._state = AdapterState.STOPPING
+                else:
+                    self._normalizer = None
+                    self._sink = None
+                    self._descriptor_capture = None
+                    self._state = AdapterState.STOPPED
             return unregister_ok and shutdown_ok
 
     def __enter__(self) -> KVTransferHostAdapter:

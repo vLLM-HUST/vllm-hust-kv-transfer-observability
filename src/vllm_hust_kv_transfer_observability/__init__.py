@@ -1,4 +1,4 @@
-"""KV transfer observability primitives and an inert activation descriptor."""
+"""KV transfer observability primitives and versioned host integration."""
 
 from .adapter import (
     HOST_OBSERVER_CONTRACT,

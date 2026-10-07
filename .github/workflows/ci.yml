@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 env:
-  EXTENSION_MANAGER_SPEC: "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@9fb467447e95d753f7002b28575d6802f4347181"
+  EXTENSION_MANAGER_SPEC: "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@5aa797cdc80d2d628b8f0e1548c53ff484df534b"
 
 jobs:
   package:
@@ -40,17 +40,7 @@ jobs:
           env -u PYTHONPATH "$wheel_python" -m pytest "$GITHUB_WORKSPACE/tests" -q
           "$wheel_cli" extension inspect org.vllm-hust.kv-transfer-observability
           "$wheel_cli" extension check org.vllm-hust.kv-transfer-observability
-          "$wheel_python" - <<'PY'
-          import pathlib
-          import subprocess
-          import sys
-
-          cli = pathlib.Path(sys.executable).with_name("vllm-hust-ext")
-          result = subprocess.run(
-              [str(cli), "extension", "enable", "org.vllm-hust.kv-transfer-observability"],
-              text=True, capture_output=True,
-          )
-          assert result.returncode == 2, result
-          assert "import_only" in result.stderr, result.stderr
-          print("enable rejected as expected: import_only")
-          PY
+          export XDG_CONFIG_HOME="$RUNNER_TEMP/kv-wheel-config"
+          "$wheel_cli" extension enable org.vllm-hust.kv-transfer-observability
+          "$wheel_cli" extension plan org.vllm-hust.kv-transfer-observability
+          "$wheel_cli" extension render org.vllm-hust.kv-transfer-observability

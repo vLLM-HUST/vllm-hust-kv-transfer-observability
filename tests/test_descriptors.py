@@ -15,8 +15,168 @@ from vllm_hust_kv_transfer_observability import (
     TransferDirection,
     TransferIdentity,
 )
+from vllm_hust_kv_transfer_observability.descriptors import AsyncDescriptorLayoutCapture
 
 PROCESS_UUID = "c" * 32
+
+
+def test_async_queue_full_does_not_wait_for_descriptor_io(tmp_path, monkeypatch):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay", max_pending=1)
+    entered, release = threading.Event(), threading.Event()
+    real_write = capture._capture._write_all
+
+    def stalled_write(fd, data):
+        entered.set()
+        assert release.wait(5)
+        real_write(fd, data)
+
+    monkeypatch.setattr(capture._capture, "_write_all", stalled_write)
+    try:
+        assert capture.capture(inventory(1))
+        assert entered.wait(2)
+        # Writer is blocked in I/O, but producer can enqueue and reject overflow.
+        assert capture.capture(inventory(2))
+        assert not capture.capture(inventory(3))
+        assert capture.counters.queue_full == 1
+        assert capture.counters.written == 0
+        assert not capture.close(0)
+        assert capture.is_alive
+        assert not capture.capture(inventory(4))
+        assert capture.counters.closed_dropped == 1
+    finally:
+        release.set()
+        assert capture.close(5)
+    assert capture.close(0)
+    assert capture.counters.written == 2
+    assert len(list(tmp_path.glob("*.json"))) == 2
+    assert capture._capture._directory_fd == -1
+
+
+@pytest.mark.parametrize(
+    "exception", [OSError("disk full"), RuntimeError("unexpected")]
+)
+def test_async_writer_failure_is_counted_and_later_work_is_drained(
+    tmp_path, monkeypatch, exception
+):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay")
+    original = capture._capture.capture
+
+    def fail_once(record):
+        if record.job_id == 1:
+            raise exception
+        return original(record)
+
+    monkeypatch.setattr(capture._capture, "capture", fail_once)
+    assert capture.capture(inventory(1))
+    assert capture.capture(inventory(2))
+    assert capture.close()
+    assert capture.counters.failed == 1
+    assert capture.counters.written == 1
+    assert capture._capture._directory_fd == -1
+
+
+def test_async_fsync_error_retains_atomic_publication_safety(tmp_path, monkeypatch):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay")
+
+    def disk_full(_fd):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(descriptors_module.os, "fsync", disk_full)
+    assert capture.capture(inventory())
+    assert capture.close()
+    assert capture.counters.failed == 1
+    assert capture.publication_counters.io_errors == 1
+    assert not list(tmp_path.iterdir())
+
+
+def test_async_concurrent_capture_close_accounts_for_every_record(tmp_path):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay", max_pending=4)
+    start = threading.Barrier(5)
+    errors = []
+
+    def produce(worker):
+        try:
+            start.wait()
+            for i in range(30):
+                capture.capture(inventory(worker * 30 + i))
+        except Exception as exc:
+            errors.append(exc)
+
+    producers = [threading.Thread(target=produce, args=(i,)) for i in range(4)]
+    for thread in producers:
+        thread.start()
+    start.wait()
+    assert capture.close(5)
+    for thread in producers:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert not errors
+    counts = capture.counters
+    assert counts.accepted + counts.queue_full + counts.closed_dropped == 120
+    assert counts.accepted == counts.written + counts.failed
+    assert counts.failed == 0
+    assert not capture.is_alive
+    assert capture._capture._directory_fd == -1
+
+
+def test_async_rejects_untyped_and_overbound_inventories(tmp_path):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay", max_regions=1)
+    assert not capture.capture({"address": 1})
+    assert not capture.capture(inventory(region_count=2))
+    assert capture.close()
+    assert capture.counters.invalid_records == 2
+    assert not list(tmp_path.iterdir())
+
+
+def test_async_serialization_bound_is_checked_by_writer(tmp_path):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay", max_record_bytes=1)
+    assert capture.capture(inventory())
+    assert capture.close()
+    assert capture.counters.failed == 1
+    assert capture.publication_counters.capacity_dropped == 1
+    assert not list(tmp_path.iterdir())
+
+
+def test_async_thread_start_failure_closes_directory(tmp_path, monkeypatch):
+    closed = []
+    real_close = descriptors_module.DescriptorLayoutCapture.close
+
+    def record_close(self):
+        real_close(self)
+        closed.append(self._directory_fd)
+
+    def fail_start(_self):
+        raise RuntimeError("thread unavailable")
+
+    monkeypatch.setattr(
+        descriptors_module.DescriptorLayoutCapture, "close", record_close
+    )
+    monkeypatch.setattr(threading.Thread, "start", fail_start)
+    with pytest.raises(RuntimeError, match="thread unavailable"):
+        AsyncDescriptorLayoutCapture(tmp_path, "replay")
+    assert closed == [-1]
+
+
+def test_async_result_callback_failure_does_not_abandon_queue(tmp_path):
+    def fail_result(_written):
+        raise RuntimeError("counter consumer failed")
+
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay", on_result=fail_result)
+    assert capture.capture(inventory(1))
+    assert capture.capture(inventory(2))
+    assert capture.close()
+    assert capture.counters.written == 2
+    assert capture.counters.result_callback_errors == 2
+
+
+@pytest.mark.parametrize("timeout", [-1, True, float("nan"), float("inf")])
+def test_async_close_rejects_invalid_timeout(tmp_path, timeout):
+    capture = AsyncDescriptorLayoutCapture(tmp_path, "replay")
+    try:
+        with pytest.raises(ValueError, match="timeout"):
+            capture.close(timeout)
+    finally:
+        assert capture.close()
 
 
 def inventory(
