@@ -1,5 +1,10 @@
 # Minimal current-host seam for KV lifecycle observations
 
+> Historical design record (2026-09-28). The worker-local subset is now wired
+> by Manifest 0.3 against vLLM-HUST PR #46. Statements below that the whole
+> package must remain `import_only` describe the earlier state; the documented
+> recovery and descriptor limitations still apply.
+
 Status: proposal for maintainer review; not an implemented or accepted host API.
 
 This document narrows the host work required by Issue #2 after checking the

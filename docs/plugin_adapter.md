@@ -111,6 +111,8 @@ unregistration failure, and thread/resource cleanup. Failure-injection tests
 also check initialization cause preservation, cleanup after multiple errors,
 and the distinction between write failures, close exceptions and timeouts.
 
-The manifest remains `import_only`. A real source-specific binding, accepted
-host seam, fixed compatibility matrix, clean enable/disable integration, and
-real-hardware evidence are still required before activation.
+Manifest 0.3 now uses the source-specific binding in `native.py` and an
+explicitly gated `vllm.general_plugins` entry point. The active path is limited
+to worker-local submit/complete/cancel records. Recovery and descriptor paths
+remain detached until their cross-process identity and ordering contracts are
+sufficient; hardware qualification remains separate.

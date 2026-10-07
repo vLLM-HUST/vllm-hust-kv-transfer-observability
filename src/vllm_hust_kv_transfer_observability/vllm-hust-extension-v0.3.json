@@ -1,0 +1,58 @@
+{
+  "schema_version": "0.3-experimental",
+  "extension_id": "org.vllm-hust.kv-transfer-observability",
+  "extension_version": "0.2.0.dev0",
+  "kind": "in_process_plugin",
+  "host": {
+    "provider": "vllm",
+    "name": "vllm",
+    "version_range": ">=0.29.1,<0.30",
+    "api_range": ">=1,<2"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "vllm-processes",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {"name": "vllm.general_plugins", "version_range": null},
+    {"name": "vllm.kv-transfer.observer", "version_range": ">=1,<2"}
+  ],
+  "components": [
+    {
+      "component_id": "kv-transfer-event-observer",
+      "implementation_ref": "vllm_hust_kv_transfer_observability.plugin:register_plugin",
+      "contracts": ["vllm.kv-transfer.observer.v1"],
+      "execution_planes": ["scheduler", "worker"],
+      "isolation": "trusted_in_process",
+      "permissions": ["filesystem_write"]
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_entry_point",
+      "group": "vllm.general_plugins",
+      "name": "kv_transfer_observability",
+      "status": "active"
+    }
+  ],
+  "requires_services": [],
+  "requires_extensions": [],
+  "resource_claims": [
+    {
+      "resource": "vllm.kv-transfer.observer",
+      "scope": "vllm-process",
+      "mode": "shared"
+    }
+  ],
+  "activation": {
+    "entry_points": [
+      {"group": "vllm.general_plugins", "name": "kv_transfer_observability"}
+    ],
+    "environment": {
+      "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVENT_PATH": ""
+    },
+    "additional_config": {}
+  }
+}
