@@ -25,9 +25,11 @@ from vllm_hust_kv_transfer_observability.descriptors import (
     DescriptorRegion,
     EvidenceLabel,
 )
+from vllm_hust_kv_transfer_observability.host_facts import HostFact, HostFactEvent
 from vllm_hust_kv_transfer_observability.schema import TransferDirection
 from vllm_hust_kv_transfer_observability.validation import (
     descriptor_from_payload,
+    host_fact_from_payload,
     main,
     observation_from_payload,
     read_events,
@@ -118,6 +120,53 @@ def test_current_writer_roundtrips_and_complete_chain(tmp_path):
         )
         == 0
     )
+
+
+def test_unjoined_host_fact_roundtrips_but_cannot_complete_chain(tmp_path, capsys):
+    fact = HostFact(
+        HostFactEvent.RECOVERY_ADMITTED,
+        "f" * 32,
+        42,
+        "req-1",
+        recovery_epoch=1,
+        job_ids=(7, 8),
+    )
+    assert host_fact_from_payload(fact.to_payload()) == fact
+    path = tmp_path / "mixed.jsonl"
+    path.write_text(json.dumps(fact.to_payload()) + "\n")
+    assert read_events(path) == [fact]
+    assert main(["--events", str(path)]) == 0
+    assert json.loads(capsys.readouterr().out)["unjoined_host_facts"] == 1
+    with pytest.raises(ValueError, match="absent or incomplete"):
+        validate_restore_chain(read_events(path), "req-1")
+    write_events(path, chain() + [fact])
+    assert validate_restore_chain(read_events(path), "req-1") == 1
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"scope": "correlated"},
+        {"request_id": "bad\x00id"},
+        {"job_ids": [8, 7]},
+        {"job_ids": [7, 7]},
+        {"job_ids": [True]},
+        {"unexpected": "0xdeadbeef"},
+    ],
+)
+def test_host_fact_validator_rejects_noncanonical_or_unsafe_fields(change):
+    fact = HostFact(
+        HostFactEvent.RECOVERY_ADMITTED,
+        "f" * 32,
+        42,
+        "req-1",
+        recovery_epoch=1,
+        job_ids=(7,),
+    )
+    payload = fact.to_payload()
+    payload.update(change)
+    with pytest.raises(ValueError):
+        host_fact_from_payload(payload)
 
 
 def test_independent_worker_clocks_and_generations():

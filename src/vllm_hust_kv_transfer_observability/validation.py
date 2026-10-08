@@ -9,7 +9,15 @@ import sys
 from collections.abc import Iterable
 from pathlib import Path
 
+from .correlated import (
+    CORRELATED_SCHEMA,
+    CorrelatedEvent,
+    CorrelatedHostObservation,
+    JobReceipt,
+    WorkerReceipt,
+)
 from .descriptors import DescriptorInventory, DescriptorRegion, EvidenceLabel
+from .host_facts import HOST_FACT_SCHEMA, HOST_FACT_SCOPE, HostFact, HostFactEvent
 from .normalization import (
     CoreRecoveryAdmitted,
     CoreRecoveryRequeued,
@@ -93,6 +101,79 @@ def observation_from_payload(payload: object) -> KVTransferObservation:
     return result
 
 
+def host_fact_from_payload(payload: object) -> HostFact:
+    """Validate unjoined host reports separately from canonical recovery chains."""
+    obj = _object(payload)
+    if obj.get("schema") != HOST_FACT_SCHEMA or obj.get("scope") != HOST_FACT_SCOPE:
+        raise ValueError("expected unjoined host fact schema")
+    fields = dict(obj)
+    del fields["schema"]
+    del fields["scope"]
+    try:
+        fields["event"] = HostFactEvent(fields["event"])
+        for name, enum_type in (
+            ("compute_kind", ComputeKind),
+            ("requeue_reason", RecoveryRequeueReason),
+        ):
+            if name in fields:
+                fields[name] = enum_type(fields[name])
+        for name in ("job_ids", "ranks"):
+            if name in fields:
+                if type(fields[name]) is not list:
+                    raise ValueError(f"{name} must be an array")
+                fields[name] = tuple(fields[name])
+        result = HostFact(**fields)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid closed host fact record") from exc
+    if result.to_payload() != obj:
+        raise ValueError("noncanonical host fact fields")
+    return result
+
+
+def correlated_from_payload(payload: object) -> CorrelatedHostObservation:
+    """Reject unknown fields and malformed nested scheduler/Worker receipts."""
+    obj = _object(payload)
+    if obj.get("schema") != CORRELATED_SCHEMA:
+        raise ValueError("expected correlated host schema v2")
+    fields = dict(obj)
+    del fields["schema"]
+    try:
+        fields["event"] = CorrelatedEvent(fields["event"])
+        if "workers" in fields:
+            if type(fields["workers"]) is not list:
+                raise ValueError("workers must be an array")
+            fields["workers"] = tuple(
+                WorkerReceipt(**_object(worker)) for worker in fields["workers"]
+            )
+        if "roster" in fields:
+            if type(fields["roster"]) is not list:
+                raise ValueError("roster must be an array")
+            roster = []
+            for value in fields["roster"]:
+                job = _object(value)
+                if (
+                    set(job) != {"job_id", "workers"}
+                    or type(job["workers"]) is not list
+                ):
+                    raise ValueError("invalid job roster")
+                roster.append(
+                    JobReceipt(
+                        job["job_id"],
+                        tuple(
+                            WorkerReceipt(**_object(worker))
+                            for worker in job["workers"]
+                        ),
+                    )
+                )
+            fields["roster"] = tuple(roster)
+        result = CorrelatedHostObservation(**fields)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("invalid closed correlated host record") from exc
+    if result.to_payload() != obj:
+        raise ValueError("noncanonical correlated host fields")
+    return result
+
+
 def descriptor_from_payload(payload: object) -> DescriptorInventory:
     """Validate every v2 region through the same types used by capture."""
     obj = _object(payload)
@@ -153,7 +234,9 @@ def _decode(data: bytes) -> object:
     )
 
 
-def read_events(path: Path) -> list[KVTransferObservation]:
+def read_events(
+    path: Path,
+) -> list[KVTransferObservation | HostFact | CorrelatedHostObservation]:
     """Read a bounded JSONL artifact without accepting ambiguous JSON keys."""
     records = []
     total = 0
@@ -166,14 +249,127 @@ def read_events(path: Path) -> list[KVTransferObservation]:
                 continue
             if len(records) >= MAX_RECORDS:
                 raise ValueError("event artifact exceeds the record limit")
-            records.append(observation_from_payload(_decode(line)))
+            payload = _decode(line)
+            if _object(payload).get("schema") == HOST_FACT_SCHEMA:
+                records.append(host_fact_from_payload(payload))
+            elif _object(payload).get("schema") == CORRELATED_SCHEMA:
+                records.append(correlated_from_payload(payload))
+            else:
+                records.append(observation_from_payload(payload))
     if not records:
         raise ValueError("no events recorded")
     return records
 
 
+def validate_correlated_restore_chain(
+    records: Iterable[KVTransferObservation | HostFact | CorrelatedHostObservation],
+    request_id: str,
+) -> int:
+    """Prove exact Worker-incarnation rosters without comparing process clocks."""
+    groups: dict[tuple[str, str, int], list[CorrelatedHostObservation]] = {}
+    job_owner: dict[tuple[str, int], tuple[str, str, int]] = {}
+    for record in records:
+        if (
+            type(record) is not CorrelatedHostObservation
+            or record.request_id != request_id
+        ):
+            continue
+        identity = (
+            record.scheduler_generation,
+            record.request_id,
+            record.recovery_epoch,
+        )
+        groups.setdefault(identity, []).append(record)
+        job_ids = ([record.job_id] if record.job_id is not None else []) + [
+            job.job_id for job in record.roster
+        ]
+        for job_id in job_ids:
+            owner_key = (record.scheduler_generation, job_id)
+            if owner_key in job_owner and job_owner[owner_key] != identity:
+                raise ValueError("job ID reused across recovery episodes")
+            job_owner[owner_key] = identity
+    if not groups:
+        raise ValueError("requested recovery chain is absent or incomplete")
+
+    def only(items: list[CorrelatedHostObservation], event: CorrelatedEvent):
+        matching = [item for item in items if item.event is event]
+        if len(matching) != 1:
+            raise ValueError(f"expected one {event.value} per recovery episode")
+        return matching[0]
+
+    for items in groups.values():
+        requeued = only(items, CorrelatedEvent.RECOVERY_REQUEUED)
+        admitted = only(items, CorrelatedEvent.RECOVERY_ADMITTED)
+        if admitted.observed_at_ns <= requeued.observed_at_ns:
+            raise ValueError("scheduler admission precedes requeue")
+        roster = {job.job_id: job for job in admitted.roster}
+        receipts = [
+            item for item in items if item.event is CorrelatedEvent.TRANSFER_RECEIPT
+        ]
+        if len(receipts) != len(roster) or {item.job_id for item in receipts} != set(
+            roster
+        ):
+            raise ValueError("admission lacks the exact transfer receipts")
+        for receipt in receipts:
+            if (
+                receipt.workers != roster[receipt.job_id].workers
+                or not requeued.observed_at_ns
+                < receipt.observed_at_ns
+                < admitted.observed_at_ns
+            ):
+                raise ValueError("transfer receipt differs from admission roster")
+        expected = {
+            (job.job_id, worker.rank, worker.worker_generation)
+            for job in admitted.roster
+            for worker in job.workers
+        }
+        stages: dict[
+            CorrelatedEvent, dict[tuple[int, int, str], CorrelatedHostObservation]
+        ] = {}
+        for event in (
+            CorrelatedEvent.RESTORE_SUBMITTED,
+            CorrelatedEvent.RESTORE_COMPLETED,
+        ):
+            matches = [item for item in items if item.event is event]
+            stage = {
+                (item.job_id, item.rank, item.worker_generation): item
+                for item in matches
+            }
+            if len(stage) != len(matches) or set(stage) != expected:
+                raise ValueError("restore stage does not match exact Worker roster")
+            stages[event] = stage
+        for key in expected:
+            if (
+                stages[CorrelatedEvent.RESTORE_COMPLETED][key].observed_at_ns
+                <= stages[CorrelatedEvent.RESTORE_SUBMITTED][key].observed_at_ns
+            ):
+                raise ValueError("Worker completion precedes submission")
+        expected_workers = {
+            (worker.rank, worker.worker_generation)
+            for job in admitted.roster
+            for worker in job.workers
+        }
+        first = [item for item in items if item.event is CorrelatedEvent.FIRST_COMPUTE]
+        first_by_worker = {(item.rank, item.worker_generation): item for item in first}
+        if (
+            len(first_by_worker) != len(first)
+            or set(first_by_worker) != expected_workers
+        ):
+            raise ValueError("first compute does not match exact Worker roster")
+        for worker, item in first_by_worker.items():
+            if item.roster != admitted.roster or any(
+                item.observed_at_ns
+                <= stages[CorrelatedEvent.RESTORE_COMPLETED][key].observed_at_ns
+                for key in expected
+                if key[1:] == worker
+            ):
+                raise ValueError("first compute has mismatched roster or Worker order")
+    return len(groups)
+
+
 def validate_restore_chain(
-    records: Iterable[KVTransferObservation], request_id: str
+    records: Iterable[KVTransferObservation | HostFact | CorrelatedHostObservation],
+    request_id: str,
 ) -> int:
     """Require complete requeue/restore/admit/compute episodes for a request.
 
@@ -181,6 +377,12 @@ def validate_restore_chain(
     receipt validation reuse LifecycleNormalizer; no identity or missing
     event is synthesized. Cross-worker clock comparisons are not performed.
     """
+    records = list(records)
+    if any(
+        type(record) is CorrelatedHostObservation and record.request_id == request_id
+        for record in records
+    ):
+        return validate_correlated_restore_chain(records, request_id)
     events = ObservationEvent
     relevant = {
         events.RECOVERY_REQUEUED,
@@ -195,6 +397,8 @@ def validate_restore_chain(
     normalizer = LifecycleNormalizer()
     try:
         for record in records:
+            if type(record) in {HostFact, CorrelatedHostObservation}:
+                continue
             if record.identity.request_id != request_id:
                 continue
             event, identity = record.event, record.identity
@@ -287,13 +491,16 @@ def validate_restore_chain(
 
 
 def validate_descriptors(
-    capture_dir: Path, records: Iterable[KVTransferObservation]
+    capture_dir: Path,
+    records: Iterable[KVTransferObservation | HostFact | CorrelatedHostObservation],
 ) -> int:
     """Check schema and explicit transfer/worker correlation, never filenames."""
     transfers: dict[
         TransferIdentity, tuple[ObservationIdentity, TransferDirection]
     ] = {}
     for event in records:
+        if type(event) in {HostFact, CorrelatedHostObservation}:
+            continue
         if event.transfer is None:
             continue
         key = (event.identity, event.direction)
@@ -331,12 +538,16 @@ def validate_descriptors(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--events", type=Path, required=True)
+    parser.add_argument("--events", type=Path, required=True, action="append")
     parser.add_argument("--capture-dir", type=Path)
     parser.add_argument("--expect-restore-chain")
     args = parser.parse_args(argv)
     try:
-        records = read_events(args.events)
+        if sum(path.stat().st_size for path in args.events) > MAX_ARTIFACT_BYTES:
+            raise ValueError("combined event artifacts exceed the byte limit")
+        records = [record for path in args.events for record in read_events(path)]
+        if len(records) > MAX_RECORDS:
+            raise ValueError("combined event artifacts exceed the record limit")
         chains = (
             validate_restore_chain(records, args.expect_restore_chain)
             if args.expect_restore_chain is not None
@@ -358,6 +569,10 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(
             {
                 "events": len(records),
+                "unjoined_host_facts": sum(type(r) is HostFact for r in records),
+                "correlated_host_records": sum(
+                    type(r) is CorrelatedHostObservation for r in records
+                ),
                 "complete_restore_episodes": chains,
                 "descriptor_inventories": descriptors,
                 "scope": "offline checks only; no hardware or host qualification",

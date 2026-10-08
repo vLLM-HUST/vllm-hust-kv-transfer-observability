@@ -1,9 +1,11 @@
 # Plugin-side host binding and configuration
 
-Status: the worker-local submit/complete/cancel path is attached to the
-merged vLLM-HUST observer API and is explicitly activatable through Manifest
-0.3. Scheduler recovery, first compute and descriptor correlation remain
-detached; no NPU qualification has been made.
+Status: worker-local submit/complete/cancel callbacks are attached to the
+merged vLLM-HUST observer API and explicitly activatable through Manifest 0.3.
+The host's v1 recovery and first-compute callbacks are recorded as unjoined
+facts. The local, unmerged v2 seam adds exact cross-process recovery rosters;
+one narrow 910B2 diagnostic exercised it. Descriptor association and a
+qualified NPU installation remain open.
 
 `KVTransferHostAdapter` joins a source-specific host binding to the existing
 typed normalizer, bounded JSONL sink, and optional address-free descriptor
@@ -113,11 +115,13 @@ unregistration failure, and thread/resource cleanup. Failure-injection tests
 also check initialization cause preservation, cleanup after multiple errors,
 and the distinction between write failures, close exceptions and timeouts.
 
-Manifest 0.3 now uses the source-specific binding in `native.py` and an
-explicitly gated `vllm.general_plugins` entry point. The active path is limited
-to worker-local submit/complete/cancel records. Recovery and descriptor paths
-remain detached until their cross-process identity and ordering contracts are
-sufficient; hardware qualification remains separate.
+Manifest 0.3 uses the source-specific binding in `native.py` and an explicitly
+gated `vllm.general_plugins` entry point. Published v1 recovery callbacks stay
+as unjoined facts; local v2 callbacks can provide complete rosters for offline
+validation. The plugin's opted-in post-fork reinitialization discards inherited
+writers and registers a new child-owned adapter when the local host loader
+calls it. Descriptor association remains detached until the copy site has
+request identity and ordering; hardware qualification remains separate.
 
 The native entry point does not retain successful H2D receipts in the
 normalizer's recovery-admission table, since scheduler admissions are not

@@ -317,6 +317,15 @@ class DescriptorLayoutCapture:
             except OSError:
                 self._increment("io_errors")
 
+    def _abandon_after_fork(self) -> None:
+        """Release the copied directory handle without taking inherited locks."""
+        descriptor = self._directory_fd
+        self._directory_fd = -1
+        self._closed = True
+        if descriptor >= 0:
+            with suppress(OSError):
+                os.close(descriptor)
+
     def __enter__(self) -> DescriptorLayoutCapture:
         return self
 
@@ -460,6 +469,10 @@ class AsyncDescriptorLayoutCapture:
         if self.counters.cleanup_errors:
             raise OSError("descriptor writer cleanup failed")
         return True
+
+    def _abandon_after_fork(self) -> None:
+        self._closing = True
+        self._capture._abandon_after_fork()
 
 
 __all__ = [

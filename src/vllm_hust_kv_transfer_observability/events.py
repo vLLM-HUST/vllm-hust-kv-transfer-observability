@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from .correlated import CorrelatedHostObservation
+from .host_facts import HostFact
 from .schema import KVTransferObservation
 
 try:
@@ -120,13 +122,19 @@ class JsonlKVTransferEventSink:
         with self._state_lock:
             self._counter_values[name] += 1
 
-    def emit(self, observation: KVTransferObservation) -> bool:
+    def emit(
+        self, observation: KVTransferObservation | HostFact | CorrelatedHostObservation
+    ) -> bool:
         """Queue one record without allowing observation failure to escape."""
         if not self.enabled:
             return False
         try:
-            if type(observation) is not KVTransferObservation:
-                raise TypeError("observation must be a KVTransferObservation")
+            if type(observation) not in {
+                KVTransferObservation,
+                HostFact,
+                CorrelatedHostObservation,
+            }:
+                raise TypeError("observation must be a typed event or host record")
             encoded = (
                 json.dumps(
                     observation.to_payload(),
@@ -251,6 +259,16 @@ class JsonlKVTransferEventSink:
     @property
     def is_alive(self) -> bool:
         return self._worker is not None and self._worker.is_alive()
+
+    def _abandon_after_fork(self) -> None:
+        """Close inherited descriptors without joining a vanished parent thread."""
+        self._closed = True
+        for name in ("_file_descriptor", "_directory_fd"):
+            descriptor = getattr(self, name)
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+                setattr(self, name, None)
 
     def close(self, timeout: float = 5.0) -> bool:
         if (
