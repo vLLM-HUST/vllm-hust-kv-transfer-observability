@@ -80,3 +80,8 @@ remaining limits are recorded in
 
 The host-independent schemas, sink bounds, normalization rules, and historical
 source audit remain documented under [`docs/`](docs/).
+
+Captured v2 JSONL records and descriptor inventories can be checked offline
+with the [artifact validator](docs/artifact_validation.md). Its complete
+restore-chain option requires recovery and first-compute records that the
+current worker-local binding does not yet produce.
