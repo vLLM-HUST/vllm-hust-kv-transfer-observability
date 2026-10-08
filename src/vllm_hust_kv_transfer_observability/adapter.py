@@ -90,10 +90,15 @@ class KVTransferHostAdapter:
     failures are contained and counted so they cannot escape into serving.
     """
 
-    def __init__(self, config: ObserverConfig) -> None:
+    def __init__(
+        self, config: ObserverConfig, *, retain_restore_receipts: bool = True
+    ) -> None:
         if type(config) is not ObserverConfig:
             raise TypeError("config must be an ObserverConfig")
+        if type(retain_restore_receipts) is not bool:
+            raise TypeError("retain_restore_receipts must be a bool")
         self.config = config
+        self._retain_restore_receipts = retain_restore_receipts
         self._state = AdapterState.STOPPED
         self._state_lock = Lock()
         self._lifecycle_lock = Lock()
@@ -128,6 +133,7 @@ class KVTransferHostAdapter:
         normalizer = LifecycleNormalizer(
             max_correlated_transfers=self.config.max_correlated_transfers,
             max_recovery_admissions=self.config.max_recovery_admissions,
+            retain_restore_receipts=self._retain_restore_receipts,
         )
         sink: JsonlKVTransferEventSink | None = None
         capture: AsyncDescriptorLayoutCapture | None = None

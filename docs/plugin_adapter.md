@@ -1,8 +1,9 @@
 # Plugin-side host binding and configuration
 
-Status: implemented and fixture-tested against the proposed observer contract;
-not attached to a current vLLM host and not activatable through Extension
-Manager.
+Status: the worker-local submit/complete/cancel path is attached to the
+merged vLLM-HUST observer API and is explicitly activatable through Manifest
+0.3. Scheduler recovery, first compute and descriptor correlation remain
+detached; no NPU qualification has been made.
 
 `KVTransferHostAdapter` joins a source-specific host binding to the existing
 typed normalizer, bounded JSONL sink, and optional address-free descriptor
@@ -64,9 +65,10 @@ allows `stop()` to retry; this is not a successful unload. Python cannot cancel
 an in-flight filesystem syscall safely. Write failure is counted separately
 from timeout, and successful closure does not imply successful publication.
 
-This interface does not prove that a current host implements the proposed
-contract. See [`current_host_seam_proposal.md`](current_host_seam_proposal.md)
-for the audited gap and candidate host attachment points.
+The current host implements the versioned observer contract for the narrow
+worker-local carrier. See
+[`current_host_compatibility.md`](current_host_compatibility.md) for its
+tested scope and the remaining identity gaps.
 
 ## Closed configuration
 
@@ -116,3 +118,9 @@ explicitly gated `vllm.general_plugins` entry point. The active path is limited
 to worker-local submit/complete/cancel records. Recovery and descriptor paths
 remain detached until their cross-process identity and ordering contracts are
 sufficient; hardware qualification remains separate.
+
+The native entry point does not retain successful H2D receipts in the
+normalizer's recovery-admission table, since scheduler admissions are not
+available in that process. The host-independent adapter retains them by
+default when a full lifecycle binding is explicitly supplied. This avoids
+eventual table exhaustion during long-running transfer-only observation.

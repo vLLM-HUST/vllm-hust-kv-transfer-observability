@@ -69,7 +69,10 @@ def register_plugin() -> None:
 
     config = ObserverConfig(enabled=True, event_path=_event_path())
     binding = VllmOffloadingObserverBinding()
-    adapter = KVTransferHostAdapter(config)
+    # This entry point observes worker-local transfers only. Keeping each H2D
+    # receipt for a scheduler admission it cannot receive would eventually
+    # exhaust the normalizer's bounded recovery table.
+    adapter = KVTransferHostAdapter(config, retain_restore_receipts=False)
     if not adapter.start(binding):
         raise RuntimeError("KV transfer observer did not activate")
     _ADAPTER = adapter

@@ -46,6 +46,7 @@ def test_plugin_registers_once_and_stops(monkeypatch, tmp_path: Path):
     adapter_factory.assert_called_once()
     adapter.start.assert_called_once_with(binding)
     assert adapter_factory.call_args.args[0].event_path == tmp_path / "events.jsonl"
+    assert adapter_factory.call_args.kwargs == {"retain_restore_receipts": False}
     assert plugin.stop_plugin() is True
     adapter.stop.assert_called_once()
 
