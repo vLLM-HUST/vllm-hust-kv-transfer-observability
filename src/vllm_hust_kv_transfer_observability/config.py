@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .descriptors import (
     DEFAULT_MAX_DESCRIPTOR_RECORD_BYTES,
+    DEFAULT_MAX_PENDING_DESCRIPTORS,
     MAX_DESCRIPTOR_REGIONS,
     EvidenceLabel,
 )
@@ -60,6 +61,7 @@ class ObserverConfig:
     max_correlated_transfers: int = DEFAULT_MAX_CORRELATED_TRANSFERS
     max_recovery_admissions: int = DEFAULT_MAX_RECOVERY_ADMISSIONS
     max_descriptor_regions: int = MAX_DESCRIPTOR_REGIONS
+    max_pending_descriptors: int = DEFAULT_MAX_PENDING_DESCRIPTORS
     max_descriptor_record_bytes: int = DEFAULT_MAX_DESCRIPTOR_RECORD_BYTES
     shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
 
@@ -112,6 +114,12 @@ class ObserverConfig:
             "max_recovery_admissions",
             1,
             MAX_TRANSFER_ASSOCIATIONS,
+        )
+        _bounded_int(
+            self.max_pending_descriptors,
+            "max_pending_descriptors",
+            1,
+            DEFAULT_MAX_PENDING_DESCRIPTORS,
         )
         _bounded_int(
             self.max_descriptor_regions,
