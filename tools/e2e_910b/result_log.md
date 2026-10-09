@@ -50,4 +50,4 @@ bash 01_env_probe.sh | tee result_0_<date>.txt
 - preemption 制造方式（并发数/序列长度/模型）
 - 预期 6-event 链 vs 实际（verify_events.py --expect-restore-chain 输出）
 - descriptor capture 清单
-- 性能对比（Tier 3）：禁用 vs 启用，TTFT/TPOT/吞吐，±% 
+- 性能对比（Tier 3）：禁用 vs 启用，TTFT/TPOT/吞吐，±%

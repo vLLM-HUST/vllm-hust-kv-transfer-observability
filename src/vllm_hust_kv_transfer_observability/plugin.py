@@ -24,6 +24,22 @@ _ADAPTER: KVTransferHostAdapter | None = None
 _BINDING: VllmOffloadingObserverBinding | None = None
 
 
+def _after_fork_in_child() -> None:
+    """Drop parent-owned writers before the child loads its own plugin copy."""
+    global _ADAPTER, _BINDING, _REGISTERED_PID
+    if os.getpid() == _REGISTERED_PID:
+        return
+    inherited = _ADAPTER
+    _ADAPTER = None
+    _BINDING = None
+    _REGISTERED_PID = None
+    if inherited is not None:
+        inherited._abandon_after_fork()
+
+
+os.register_at_fork(after_in_child=_after_fork_in_child)
+
+
 def _activation_requested() -> bool:
     bundles = os.getenv(_ENABLED_BUNDLES_ENV)
     if bundles is not None:
@@ -69,13 +85,22 @@ def register_plugin() -> None:
 
     config = ObserverConfig(enabled=True, event_path=_event_path())
     binding = VllmOffloadingObserverBinding()
-    adapter = KVTransferHostAdapter(config)
+    # Worker-local transfers normalize to canonical events; recovery and
+    # first-compute callbacks remain separate, unjoined host facts. Keeping
+    # H2D receipts for admissions this process cannot correlate would
+    # eventually exhaust the normalizer's bounded recovery table.
+    adapter = KVTransferHostAdapter(config, retain_restore_receipts=False)
     if not adapter.start(binding):
         raise RuntimeError("KV transfer observer did not activate")
     _ADAPTER = adapter
     _BINDING = binding
     _REGISTERED_PID = process_id
     atexit.register(stop_plugin)
+
+
+# The host loader may re-invoke only explicitly opted-in entry points after a
+# fork. This entry point drops parent-owned resources in _after_fork_in_child.
+register_plugin.__vllm_reinit_after_fork__ = True
 
 
 __all__ = [

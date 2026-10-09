@@ -29,6 +29,13 @@ from .config import (
     ConfigurationError,
     ObserverConfig,
 )
+from .correlated import (
+    CORRELATED_SCHEMA,
+    CorrelatedEvent,
+    CorrelatedHostObservation,
+    JobReceipt,
+    WorkerReceipt,
+)
 from .descriptors import (
     ALLOWED_EVIDENCE_LABELS,
     DescriptorCaptureCounters,
@@ -38,6 +45,7 @@ from .descriptors import (
     EvidenceLabel,
 )
 from .events import MIN_RECORD_BYTES, EventSinkCounters, JsonlKVTransferEventSink
+from .host_facts import HostFact, HostFactEvent
 from .normalization import (
     CoreRecoveryAdmitted,
     CoreRecoveryRequeued,
@@ -86,6 +94,9 @@ __all__ = [
     "B134Owner",
     "ComputeKind",
     "ConfigurationError",
+    "CORRELATED_SCHEMA",
+    "CorrelatedEvent",
+    "CorrelatedHostObservation",
     "CoreRecoveryAdmitted",
     "CoreRecoveryRequeued",
     "CoreTransferCancelled",
@@ -97,11 +108,14 @@ __all__ = [
     "DescriptorRegion",
     "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS",
     "EventSinkCounters",
+    "HostFact",
+    "HostFactEvent",
     "EvidenceLabel",
     "FirstComputeObserved",
     "HostObserverBinding",
     "HostObserverCallbacks",
     "JsonlKVTransferEventSink",
+    "JobReceipt",
     "KVTransferObservation",
     "LifecycleNormalizer",
     "MAX_SHUTDOWN_TIMEOUT_SECONDS",
@@ -119,5 +133,6 @@ __all__ = [
     "TransferTerminalReason",
     "KVTransferHostAdapter",
     "VllmHustKvTransferObservabilityContractProposal",
+    "WorkerReceipt",
     "b134_event_contract",
 ]

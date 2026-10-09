@@ -11,14 +11,18 @@ from time import monotonic
 from typing import Protocol
 
 from .config import ObserverConfig
+from .correlated import CorrelatedHostObservation
 from .descriptors import AsyncDescriptorLayoutCapture, DescriptorInventory
 from .events import JsonlKVTransferEventSink
+from .host_facts import HostFact
 from .normalization import LifecycleNormalizer, SourceObservation
 
 HOST_OBSERVER_CONTRACT = "vllm.kv-transfer.observer.v1"
 
 ObservationCallback = Callable[[SourceObservation], bool]
 DescriptorCallback = Callable[[DescriptorInventory], bool]
+HostFactCallback = Callable[[HostFact], bool]
+CorrelatedCallback = Callable[[CorrelatedHostObservation], bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +31,8 @@ class HostObserverCallbacks:
 
     observe: ObservationCallback
     descriptor: DescriptorCallback | None
+    host_fact: HostFactCallback | None = None
+    correlated: CorrelatedCallback | None = None
 
 
 class HostObserverBinding(Protocol):
@@ -69,6 +75,12 @@ class AdapterCounters:
     registrations: int = 0
     observations_received: int = 0
     observations_emitted: int = 0
+    host_facts_received: int = 0
+    host_facts_emitted: int = 0
+    host_facts_dropped: int = 0
+    correlated_received: int = 0
+    correlated_emitted: int = 0
+    correlated_dropped: int = 0
     normalization_dropped: int = 0
     sink_dropped: int = 0
     descriptors_received: int = 0
@@ -90,10 +102,15 @@ class KVTransferHostAdapter:
     failures are contained and counted so they cannot escape into serving.
     """
 
-    def __init__(self, config: ObserverConfig) -> None:
+    def __init__(
+        self, config: ObserverConfig, *, retain_restore_receipts: bool = True
+    ) -> None:
         if type(config) is not ObserverConfig:
             raise TypeError("config must be an ObserverConfig")
+        if type(retain_restore_receipts) is not bool:
+            raise TypeError("retain_restore_receipts must be a bool")
         self.config = config
+        self._retain_restore_receipts = retain_restore_receipts
         self._state = AdapterState.STOPPED
         self._state_lock = Lock()
         self._lifecycle_lock = Lock()
@@ -128,6 +145,7 @@ class KVTransferHostAdapter:
         normalizer = LifecycleNormalizer(
             max_correlated_transfers=self.config.max_correlated_transfers,
             max_recovery_admissions=self.config.max_recovery_admissions,
+            retain_restore_receipts=self._retain_restore_receipts,
         )
         sink: JsonlKVTransferEventSink | None = None
         capture: AsyncDescriptorLayoutCapture | None = None
@@ -185,6 +203,8 @@ class KVTransferHostAdapter:
             callbacks = HostObserverCallbacks(
                 observe=self.observe,
                 descriptor=self.capture_descriptor if capture is not None else None,
+                host_fact=self.observe_host_fact,
+                correlated=self.observe_correlated,
             )
             try:
                 handle = binding.register(callbacks)
@@ -288,6 +308,38 @@ class KVTransferHostAdapter:
         self._increment(counter)
         return bool(output)
 
+    def observe_host_fact(self, fact: HostFact) -> bool:
+        """Queue one unjoined host fact without treating it as a full receipt."""
+        with self._state_lock:
+            if self._state is not AdapterState.ACTIVE:
+                self._counter_values["inactive_dropped"] += 1
+                return False
+            self._counter_values["host_facts_received"] += 1
+            sink = self._sink
+        try:
+            accepted = sink is not None and sink.emit(fact)
+        except Exception:
+            self._increment("callback_errors")
+            accepted = False
+        self._increment("host_facts_emitted" if accepted else "host_facts_dropped")
+        return accepted
+
+    def observe_correlated(self, record: CorrelatedHostObservation) -> bool:
+        """Queue a versioned host link without affecting the serving path."""
+        with self._state_lock:
+            if self._state is not AdapterState.ACTIVE:
+                self._counter_values["inactive_dropped"] += 1
+                return False
+            self._counter_values["correlated_received"] += 1
+            sink = self._sink
+        try:
+            accepted = sink is not None and sink.emit(record)
+        except Exception:
+            self._increment("callback_errors")
+            accepted = False
+        self._increment("correlated_emitted" if accepted else "correlated_dropped")
+        return accepted
+
     def _descriptor_result(self, written: bool) -> None:
         self._increment("descriptors_written" if written else "descriptors_dropped")
 
@@ -330,6 +382,19 @@ class KVTransferHostAdapter:
                     self._descriptor_capture = None
                     self._state = AdapterState.STOPPED
             return unregister_ok and shutdown_ok
+
+    def _abandon_after_fork(self) -> None:
+        """Discard parent-owned writers in a forked child without their locks."""
+        self._state = AdapterState.STOPPED
+        if self._sink is not None:
+            self._sink._abandon_after_fork()
+        if self._descriptor_capture is not None:
+            self._descriptor_capture._abandon_after_fork()
+        self._binding = None
+        self._handle = None
+        self._normalizer = None
+        self._sink = None
+        self._descriptor_capture = None
 
     def __enter__(self) -> KVTransferHostAdapter:
         return self

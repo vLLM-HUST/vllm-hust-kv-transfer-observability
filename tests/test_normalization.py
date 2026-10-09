@@ -430,6 +430,45 @@ def test_capacity_is_bounded_and_disables_incomplete_evidence() -> None:
         LifecycleNormalizer(max_correlated_transfers=4097)
 
 
+def test_worker_only_mode_does_not_exhaust_unused_recovery_receipts() -> None:
+    normalizer = LifecycleNormalizer(
+        max_correlated_transfers=1, retain_restore_receipts=False
+    )
+    for sequence in range(1, 4):
+        assert (
+            normalizer.normalize(
+                CoreTransferSubmitted(
+                    identity(),
+                    transfer(sequence),
+                    TransferOperation.H2D_RESTORE,
+                    block_count=1,
+                    observed_at_ns=sequence * 10,
+                )
+            )
+            is not None
+        )
+        completed = normalizer.normalize(
+            CoreTransferCompleted(
+                transfer(sequence),
+                observed_at_ns=sequence * 10 + 1,
+                success=True,
+                bytes_moved=4096,
+                receipt=receipt(sequence),
+            )
+        )
+        assert completed is not None
+        assert completed.event is ObservationEvent.RESTORE_COMPLETED
+    assert normalizer.evidence_valid
+    assert normalizer.counters.accepted == 6
+    # The opt-in cannot claim a scheduler admission from worker-only records.
+    assert (
+        normalizer.normalize(
+            CoreRecoveryAdmitted(identity(), (transfer(3),), observed_at_ns=50)
+        )
+        is None
+    )
+
+
 def test_requeue_preserves_closed_reason_and_epoch() -> None:
     normalizer = LifecycleNormalizer()
     event = normalizer.normalize(

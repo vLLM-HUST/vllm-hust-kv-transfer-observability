@@ -28,6 +28,8 @@ jobs:
       - run: ruff format --check .
       - run: pytest -q
       - run: python -m build
+      - name: Verify wheel uninstall in a disposable environment
+        run: python tools/check_wheel_uninstall.py dist/*.whl
       - run: vllm-hust-ext extension inspect org.vllm-hust.kv-transfer-observability
       - name: Validate installed wheel in an isolated environment
         shell: bash

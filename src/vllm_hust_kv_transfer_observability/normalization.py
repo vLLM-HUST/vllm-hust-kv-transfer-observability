@@ -233,6 +233,7 @@ class LifecycleNormalizer:
         *,
         max_correlated_transfers: int = DEFAULT_MAX_CORRELATED_TRANSFERS,
         max_recovery_admissions: int = DEFAULT_MAX_RECOVERY_ADMISSIONS,
+        retain_restore_receipts: bool = True,
     ) -> None:
         for value, name in (
             (max_correlated_transfers, "max_correlated_transfers"),
@@ -244,6 +245,9 @@ class LifecycleNormalizer:
                 )
         self.max_correlated_transfers = max_correlated_transfers
         self.max_recovery_admissions = max_recovery_admissions
+        if type(retain_restore_receipts) is not bool:
+            raise ValueError("retain_restore_receipts must be a bool")
+        self.retain_restore_receipts = retain_restore_receipts
         self._pending: dict[TransferIdentity, CoreTransferSubmitted] = {}
         self._completed_restores: dict[TransferIdentity, _CompletedRestore] = {}
         self._admissions: dict[ObservationIdentity, _RecoveryAdmission] = {}
@@ -360,7 +364,10 @@ class LifecycleNormalizer:
         if pending.operation is TransferOperation.H2D_RESTORE:
             if duration_ns == 0 or source.receipt is None:
                 raise ValueError("successful restore requires a later receipt")
-            if len(self._completed_restores) >= self.max_correlated_transfers:
+            if (
+                self.retain_restore_receipts
+                and len(self._completed_restores) >= self.max_correlated_transfers
+            ):
                 del self._pending[source.transfer]
                 self._disable_for_capacity()
                 return None
@@ -376,9 +383,10 @@ class LifecycleNormalizer:
                 duration_ns=duration_ns,
                 device_duration_ns=source.device_duration_ns,
             )
-            self._completed_restores[source.transfer] = _CompletedRestore(
-                pending.identity, source.receipt, source.observed_at_ns
-            )
+            if self.retain_restore_receipts:
+                self._completed_restores[source.transfer] = _CompletedRestore(
+                    pending.identity, source.receipt, source.observed_at_ns
+                )
         else:
             if duration_ns == 0 or source.receipt is not None:
                 raise ValueError("preserve completion has invalid receipt or timing")
