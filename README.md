@@ -97,3 +97,11 @@ Captured v2 JSONL records and descriptor inventories can be checked offline
 with the [artifact validator](docs/artifact_validation.md). Its complete
 restore-chain option accepts correlated recovery and first-compute records
 from the local v2 host follow-up. Published v1.0 host output remains unjoined.
+
+## Canonical MOD metadata
+
+Repository identity, directly responsible maintainers, advisor status, default-off
+activation, rollback, scope, and evidence qualification are recorded in
+[`MOD_METADATA.json`](MOD_METADATA.json). `advisor_status: unknown` is not the
+same as confirmed `none`. Performance statements remain limited to the workloads
+and evidence labels recorded there; they are not general online claims.
