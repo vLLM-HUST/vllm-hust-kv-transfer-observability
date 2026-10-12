@@ -506,9 +506,10 @@ def test_reused_rank_and_job_after_worker_restart_cannot_join_scheduler_fact(
         validate_restore_chain(workers + facts, "request-7")
 
 
-def test_binding_fails_closed_on_unknown_host_api() -> None:
+@pytest.mark.parametrize("api_version", ["1.0", "2.0"])
+def test_binding_fails_closed_on_unknown_host_api(api_version: str) -> None:
     host = FakeHost()
-    host.KV_TRANSFER_OBSERVABILITY_API_VERSION = "2.0"
+    host.KV_TRANSFER_OBSERVABILITY_API_VERSION = api_version
 
     try:
         VllmOffloadingObserverBinding(host)

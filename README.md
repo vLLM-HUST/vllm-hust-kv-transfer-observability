@@ -10,7 +10,7 @@ Technical ownership belongs to @xiehanlong834-gif and @Remygred. See
 ## Current status
 
 The Manifest 0.3 carrier is activatable against the versioned
-`vllm.kv-transfer.observer` 1.x host protocol. Its active scope is deliberately
+`vllm.kv-transfer.observer` 1.1 host protocol. Its active scope is deliberately
 narrow:
 
 - the `vllm.general_plugins` entry point attaches only after explicit ECPA or
