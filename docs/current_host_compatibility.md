@@ -1,360 +1,196 @@
-# Current-host compatibility
+# Current host compatibility (2026-10-12)
 
-## Local 910B2 NPU diagnostic (2026-10-08, uncommitted)
+The merged [core #46](https://github.com/vLLM-HUST/vllm-hust/pull/46)
+publishes the default-off v1 transfer observer. Merged
+[core #48](https://github.com/vLLM-HUST/vllm-hust/pull/48) adds the optional
+v2 scheduler/Worker generation and recovery-roster protocol. Merged
+[plugin #12](https://github.com/vLLM-HUST/vllm-hust-kv-transfer-observability/pull/12)
+consumes those protocols. The v1-only path still writes separately scoped
+host facts; it cannot attest a cross-process restore chain.
 
-The selected baseline remains organization core main `c3e05329b7` with the
-local v2 observer seam. An isolated Ascend worktree at `runtime-npu/ascend`
-starts from HUST main `575bd1c265`. Its three local source changes skip
-unavailable `fla_npu` imports for models not used here, skip the V2-only import
-of core's removed `gpu.spec_decode.autoregressive` module, and call
-`observe_forward_batch` at the real Ascend V1 forward boundary. The last
-change matches the intent of collaborator branch
-`feat/kv-transfer-observability-call-sites`; it is not yet integrated into
-Ascend main. The plugin was installed from this worktree's locally built wheel.
-All of this remains local; the original Ascend worktree is unchanged.
+## Exact checked baseline
 
-This is an **experimental single-model pairing**, not a resolved package
-compatibility matrix. The candidate uses Python 3.12, Torch 2.13.0+cpu,
-TorchNPU 2.13.0rc1, Transformers 5.19.0, CANN 9.1.0, and the available
-Triton-Ascend 3.2.2 on a 910B2. Ascend still declares Transformers 5.14.1
-and Triton-Ascend 3.6.0. The latter was not found in the checked package
-indexes. `uv pip check` reports ten incompatibilities, including those two,
-Triton-Ascend 3.2.2's older dependency pins, and missing Triton 3.5.0.
-A direct CMake build supplied the `vllm_ascend_C` binding and
-`swap_blocks_batch` for this diagnostic. The full Ascend custom-operator
-package build was stopped after about 28 minutes while compiling unrelated
-operator variants; it did not qualify an installable Ascend release.
+### Clean package pairing (supersedes the diagnostic packaging gaps below)
 
-Real-device evidence in `runtime-npu/`:
+Core main `5a820400f` was built as a device-free wheel for the external NPU
+backend (`VLLM_TARGET_DEVICE=empty`). Ascend `575bd1c265`, with the local
+compatibility/call-site changes described below and Transformers pinned to
+5.19.0, completed its full wheel build, including the native binding and
+CANN custom operators. Both wheels, the plugin wheel and Extension Manager
+`5aa797cdc` were installed into a newly created Python 3.12 environment.
+No editable installation or source `PYTHONPATH` override was used.
+
+This candidate uses Torch 2.13.0+cpu, TorchNPU 2.13.0rc1, Transformers
+5.19.0, NumPy 2.2.6 and Triton-Ascend 3.6.0+dev20260921 on one 910B2 with
+CANN 9.1.0. The Triton-Ascend wheel comes from the official
+[nightly index](https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly/triton-ascend/),
+but its NumPy requirement was locally changed from 1.26.4 to `>=2,<2.3`.
+This is a locally adapted candidate, not an unmodified official package or
+a general compatibility claim. Upstream Triton 3.6.0 must be installed
+before Triton-Ascend because they share Python module paths.
+
+Verified results in the clean environment:
+
+- All 190 installed packages pass `uv pip check`, including Ascend.
+- Extension Manager inspect/check/enable/plan/render/disable pass;
+  installation remains default-off and check reports compatible/configured.
+- The plugin's 250 tests pass.
+- The official Triton-Ascend vector-add example runs on NPU with a fresh
+  compilation cache and maximum difference 0 from TorchNPU.
+- Qwen3-0.6B real CPU KV offload/restore returns `[4236, 11]` for both cold
+  and restored inference. All five observer records validate. This simple
+  probe does not exercise a scheduler-preemption recovery chain.
+- Spawned EngineCore exits successfully with an explicit 30-second
+  shutdown grace period; no forced kill was needed.
+- An 80 MiB, three-request KV-pressure run produces 30 valid records,
+  including two complete recovery episodes and 12 correlated host records.
+  All three output digests match the earlier diagnostic.
+- Live Worker stop returns true; a second real restore succeeds and leaves
+  the record count unchanged at five. Only this test enables callable
+  serialization for its Worker RPC; that is not a production setting.
+
+Local raw evidence is under `verification-current-20261009/`:
+`ascend-wheel-build.log`, `clean-ascend-install.log`,
+`clean-installed-provenance.log`, `clean-requirements.txt`,
+`clean-manager-check.log`, `clean-plugin-tests.log`,
+`clean-nightly-vector-add.log`, `clean-restore*.log`/JSONL,
+`clean-pressure*.log`/JSONL and `clean-live-stop.log`/JSONL.
+On 2026-10-10, Triton source `5aef383d` completed its full wheel build with
+the same NumPy constraint. The successful build uses the bundled LLVM 22
+linker before CANN's LLD 15 on PATH. Its
+`triton_ascend-3.6.0+git5aef383d-cp312-cp312-linux_aarch64.whl` contains the
+native compiler library and passed ZIP integrity checks. It replaced the
+nightly in the clean environment through the normal dependency resolver;
+all 190 packages remain compatible. Fresh-cache NPU vector add again has
+maximum difference 0, and 273 combined plugin/Ascend tests pass. These are
+local source changes, not an upstream release. Exact installed origins,
+requirements and results are in `source-installed-provenance.log`,
+`source-requirements.txt`, `source-wheel-inspection.log`,
+`source-pip-check.log`, `source-vector-add.log`, and `source-package-tests.log`.
+The source-built combination also passes the Manager lifecycle check and
+real 80 MiB/three-request pressure recovery: 30 records, two complete
+recovery episodes, identical output digests to the nightly run, and clean
+shutdown (`source-manager-check.log`, `source-pressure.log`,
+`source-pressure-events.jsonl`, `source-pressure-validation.log`).
+Live stop and disabled restore also pass on this final source-built stack:
+stop returns true and the second restore leaves five records unchanged;
+disabled cold/restored IDs match `[4236, 11]` and no event file is created.
+Both exit normally (`source-live-stop.log`, `source-disabled.log`).
+
+## Descriptor identity and restart checks
+
+The host observer API is v1.1. Each accepted Worker submission now creates a
+short-lived token. The copy site records its bounded, region-relative layout
+inside that submission context; after the backend accepts the submission the
+host publishes the layout with request ID, rank, Worker generation and token.
+The plugin creates one transfer identity and requires the same identity for
+the descriptor inventory and terminal transfer event. Rejected submissions,
+wrong tokens, duplicate layouts and incomplete inventories are discarded.
+The token is internal and is not written to the user event schema.
+
+With the rebuilt core/plugin wheels and source Triton wheel, the real 910B2
+pressure run produced five descriptor inventories. Offline validation accepted
+30 events, 12 correlated host records, two complete recovery episodes and all
+five inventories (`descriptor-validation-20261011.log`). The descriptor files
+contain only relative offsets, sizes, region IDs and bounded identity. A
+separate clean process produced a different Worker generation and transfer
+namespace with two validated inventories (`descriptor-restart-validation.log`).
+
+The backend-failure unit test reports `success=false` before preserving the
+host's existing fail-stop behavior; no successful receipt is emitted. Existing
+adapter and sink tests cover event-write failure without raising into serving.
+Wheel uninstall removes the plugin import, reinstall restores a zero-conflict
+environment, and Extension Manager enable/disable/forget in temporary state
+leaves the bundle disabled with no activation intent.
+
+On 2026-10-12, separate real 910B2 pressure runs each validated 30 events,
+two complete recoveries and five descriptor inventories. Both reused restore
+job IDs 2 and 4 but had disjoint Worker generations and transfer namespaces.
+Removing one correlated receipt from an artifact copy made chain validation
+reject it. A controlled failed backend **report** on the real NPU exposed a
+field mismatch: the local core included a non-null transfer size on failure,
+which the plugin refused as success evidence. The local core now publishes
+`bytes_moved=None` on failure; its rebuilt wheel produced a `transfer_failed`
+record without a successful receipt before the existing host fail-stop. The
+underlying transfer was not physically failed. A separate plugin-writer ENOSPC
+injection left all three model outputs correct while counting 30 I/O errors.
+Live stop again held the event count at five after a second successful
+restore. An ABBA off/on/on/off timing sample showed mean generation times
+22.785/22.679 s with matching outputs; the observed −0.46% difference is
+within sample variation and does not establish a performance claim. Actual
+wheel uninstall, real event-free serving, reinstall, Manager lifecycle and
+fresh enabled recovery also passed. Full local evidence is
+`verification-current-20261009/single-card-20261012/RESULTS.md`.
+
+The current local qualification remains one 910B2 with the V1 model runner.
+It does not cover multi-rank, V2 model runner, physical device faults,
+in-place Worker restart, HTTP serving, or long-running multi-process rollback.
+
+### Earlier source-based diagnostic
+
+| Component | Revision or environment | Result |
+| --- | --- | --- |
+| Core source | `vLLM-HUST/vllm-hust` main `5a820400f` | 73 focused observer, recovery, capability and plugin tests passed. |
+| Plugin source | this repository main `05fcf5c` | 250 tests, Ruff, wheel build and isolated wheel installation passed. |
+| Extension Manager | `5aa797cdc` | Isolated wheel `inspect`, `check`, `enable`, `plan`, `render`, and `disable` passed with merged core source on `PYTHONPATH`; `check` reported `compatible` and `configured`. The virtual environment used a temporary Triton 3.6 overlay and older installed core version metadata, so this is a source/capability check, not a clean merged-core installation. |
+| Ascend source | `575bd1c265` plus uncommitted local compatibility and call-site changes | 15 focused native CPU-offload tests passed. This is a diagnostic candidate, not a package-supported revision. |
+| 910B2 device | Python 3.12, Torch 2.13.0+cpu, TorchNPU 2.13.0rc1, CANN 9.1.0, Transformers 5.19.0, source Triton-Ascend 3.6.0+git5aef383d | Real V1 CPU KV offload, recovery and descriptor capture passed in the clean wheel environment. |
+
+The Ascend candidate incorporates collaborator commit `3a5912bb92a8` from
+`feat/kv-transfer-observability-call-sites`: region-relative copy descriptors
+in `cpu_npu.py` and the V1 real-forward callback. It also guards imports of
+model-specific `fla_npu` and a removed core V2 speculative-decode module,
+and adapts Ascend's V1 runner to the merged core's removed `PassConfig.enable_sp`
+and `resolve_cudagraph_mode_and_sizes(tensor_parallel_size=...)` arguments.
+The latest checked Ascend main `8770e692` did not pass import with core
+`5a820400f`: after optional-import guards, it requested the absent
+`maybe_prepare_dcp_local_seq_lens` symbol. The older source candidate is
+therefore the current core-first diagnostic path.
+
+## Real-device observations on the merged core/plugin source
+
+These runs used one 910B2, Qwen3-0.6B, the Ascend V1 runner, default `fork`,
+and native CPU KV offload. Commands are the existing
+`runtime-npu/run_cpu_kv_restore.py`, `run_preemption.py 80 3 no-prefix`, and
+`run_disable_during_serving.py`, with merged core and plugin source plus the
+local Ascend candidate on `PYTHONPATH`. Original stdout and JSONL files are
+preserved in the local workspace's `verification-current-20261009/` directory.
 
 | Probe | Observed result |
-|---|---|
-| Model baseline | Qwen3-0.6B loaded on NPU and generated two tokens; clean exit. |
-| CPU KV offload/restore | A cold prompt, prefix-cache reset, and CPU restore produced identical token IDs `[4236, 11]`. With plugin activation in a spawned EngineCore, JSONL contains D2H and H2D start/completion plus a host transfer receipt; each copy moved 14,680,064 bytes. |
-| Recovery pressure | With 80 MiB NPU KV cache, three 129-token prompts, 145 generated tokens, and GPU prefix caching disabled, one request was preempted twice. The plugin wrote 30 records; the validator accepted **two complete v2 restore episodes** for the same request, epochs 1 and 2, jobs 2 and 4, exact rank-0 Worker-generation rosters, admissions, and first compute. All three requests finished with the same output digests as the corresponding prefix-cached run. |
-| Failure | A temporary, explicit H2D-copy exception produced `EngineDeadError`. Only the prior successful D2H preserve records were written; no restore completion was invented. The injection was removed. This reveals a serving-failure path, not graceful recovery from a backend fault. |
-| Disabled/unregistered plugin | Starting with the bundle disabled completed the same real KV restore with identical token IDs and no event file. In a separate live process, one restore wrote five records; `stop_plugin()` on the Worker returned success, a second restore completed, and the record count remained five. |
-| Timing probe | Six restores per condition, first sample excluded: disabled median 171.341 ms, enabled median 183.982 ms (12.641 ms / 7.4% difference). This is one sequential, small-sample run and is **not** a qualified steady-state overhead estimate. |
+| --- | --- |
+| Enabled KV restore | Cold and restored output IDs were both `[4236, 11]`. The JSONL file has four canonical v2 D2H/H2D start/completion records and one separately scoped v1 host receipt. The installed package validator accepted all five records for schema validation. |
+| KV-pressure recovery | Three requests each generated 145 tokens. The output digests matched the earlier local diagnostic run. The 30-record JSONL file has 12 correlated v2 host records; `validation --expect-restore-chain 1-aa6f8cde` accepted two complete recovery episodes. Eight v1 host facts remain separately scoped. |
+| Disabled plugin | The same simple KV restore produced matching output IDs and no event file. |
+| Live stop | Worker-side `stop_plugin()` returned true after the first restore wrote five records. A second restore returned the same token IDs and left the record count at five. This isolated test used `VLLM_ALLOW_INSECURE_SERIALIZATION=1` solely to carry its test callable through Worker RPC; it is not a production setting. |
 
-The subsequent local fork-lifecycle fix reinitializes only general plugins
-that opt in after a fork. Re-running all inherited general plugins made Ascend
-register `MooncakeConnectorV1` twice and prevented EngineCore startup. The
-host's v1/v2 observer registries now discard inherited callbacks and locks;
-this plugin closes copied writer descriptors without joining vanished parent
-threads before the child attaches its own adapter. With the local core fix and
-rebuilt plugin wheel, the default `fork` run restored identical token IDs and
-wrote five real D2H/H2D/receipt records. In another forked NPU process,
-`stop_plugin()` on the Worker returned true after the first restore wrote five
-records; the second restore succeeded and the count remained five. The live
-unregister test invoked a local Worker callable through vLLM RPC, requiring
-`VLLM_ALLOW_INSECURE_SERIALIZATION=1` only for that isolated test.
-The same three-request/80 MiB/no-prefix pressure workload under default fork
-wrote 30 records; offline validation accepted two complete v2 recovery
-episodes for one request. Its three output digests matched the earlier spawn
-run exactly.
-With the bundle disabled under default fork, the same simple restore
-completed with matching token IDs and created no event file.
+The earlier diagnostic used a separately built `vllm_ascend_C` binding copied into
+the source tree. At that point no full Ascend wheel/custom-operator build or clean combined
+installation had passed. Unmodified Ascend declares `transformers==5.14.1` while
+core requires `>=5.16.1,<5.20.0`; Ascend also declares
+`triton-ascend==3.6.0`, which was absent from the checked package index. The
+available 3.2.2 environment produces ten `uv pip check` incompatibilities.
+The checked [Triton-Ascend release list](https://github.com/triton-lang/triton-ascend/releases)
+ends at 3.2.2; the separate nightly index was found later, as described above.
+An isolated dependency experiment installed 3.2.2's declared NumPy 1.26.4,
+Triton 3.5.0, and other pins; that reduced the environment report to four
+conflicts but introduced a hard conflict with core's
+`opencv-python-headless>=4.13` (OpenCV 4.13 requires NumPy >=2 on Python
+3.12). No clean core-first package pairing was produced. The experimental
+3.2.2 pin change was reverted from the Ascend candidate.
+Changing requirement text alone would not prove the binaries and runtime
+compatible.
 
-The earlier five-second force-kill in `spawn` also reproduced with the plugin
-disabled. With an explicit 30-second process-manager grace, disabled and
-enabled spawn runs both finished cleanly after roughly five to seven seconds
-of EngineCore teardown; the enabled run wrote five records. This points to the
-host's default five-second NPU cleanup window rather than plugin ownership,
-but it does not establish clean teardown for every model or device. The
-30-second grace is a diagnostic call to `engine_core.shutdown(timeout=30)`,
-not a plugin configuration or a claimed production default.
+The earlier source diagnostic had no descriptor association. The rebuilt
+v1.1 host/plugin path now associates the copy-site record with the accepted
+submission as described above. Multi-rank, V2 runner, backend-fault
+degradation beyond the tested fail-stop/report behavior, repeated
+rollback/uninstall, and steady-state performance remain unqualified.
+The six-sample timing probe in the earlier local experiment was exploratory
+only; it is not used as a performance claim.
 
-The complete-chain result covers one 910B2, one dense model, the Ascend V1
-runner, CPU offload, and this local v2 observer. It does not cover multi-rank
-receipt aggregation, descriptor layout capture, V2 runner, broad model or
-kernel compatibility, graceful backend-failure recovery, all process exits,
-package dependency resolution, or release-grade performance. The previously
-stated omissions below describe the published v1 baseline and pre-diagnostic
-checks.
-
-## Local v2 follow-up (uncommitted, 2026-10-08)
-
-The current-core worktree at `runtime-current/core` now has a local
-`feature/kv-observer-v2-correlation` branch. It keeps #46's v1.0 observer
-unchanged and adds an optional `vllm.kv-transfer.observer.v2` protocol. The
-scheduler issues an incarnation token and carries the recovery epoch on load
-jobs. Workers issue their own incarnation tokens, attach them to completed
-load metadata, and report first compute with the exact accepted roster sent
-back by the scheduler. The plugin binds both interfaces and writes v2 facts
-as `vllm-hust.kv-transfer-correlated-host.v2`; v1 facts stay separate.
-
-The focused core tests and plugin source tests pass. At this earlier
-checkpoint, a synthetic public-API smoke wrote six v2 records and validated
-one complete chain without executing a connector, model forward, or NPU copy;
-the real-device evidence is reported above. The v2 seam has not been merged
-or published. The Manifest still
-requires only the published v1 protocol, so an older host can produce
-Worker-local observations but cannot prove a v2 chain. Copy-site descriptor
-and Ascend V1 first-forward gaps remain open. Current core is the priority;
-Ascend remains a separate compatibility candidate.
-
-The rest of this document records the published v1 baseline and earlier
-compatibility investigation. Statements that the stronger identity seam is
-absent refer to that baseline.
-
-Status: current-main package and CPU observer checks refreshed on 2026-10-08.
-Current `vllm-hust` main is the fixed baseline. The isolated CPU environment
-now has compatible installed dependencies with Ascend removed; Ascend is a
-separate, unqualified candidate. Serving, NPU, and performance remain
-unqualified. The merged contract lacks the shared cross-process identity
-needed for strict per-Worker attribution.
-
-## Published host-contract baseline
-
-| Component | Revision | Evidence |
-|---|---|---|
-| `vLLM-HUST/vllm-hust` | current main `c3e05329b7`; #46 head `c2e9e7d53` merged as `115e5f6b0d` | public `vllm.kv-transfer.observer.v1`, capability registry version `1.0`, host-owned runtime evidence |
-| this extension | Manifest 0.3 on main `529ab28` | active general-plugin carrier and clean-wheel host binding |
-| Extension Manager | `5aa797cdc` | discover/check/enable/plan/render and live-process evidence validation |
-
-The host change in [vllm-hust#46](https://github.com/vLLM-HUST/vllm-hust/pull/46)
-and the narrow carrier in [extension#10](https://github.com/vLLM-HUST/vllm-hust-kv-transfer-observability/pull/10)
-are merged. #46 completed the published v1.0 host outlet: real transfer,
-receipt, recovery requeue/admission, descriptor, and first-compute callbacks.
-#10 deliberately consumes only Worker-local submit/complete/cancel callbacks.
-This plugin limitation must not be described as an unfinished #46 host seam.
-Their CPU evidence does not establish serving or NPU compatibility. The
-Manifest's host range is `>=0.29.1,<0.30`. Earlier raw `setuptools_scm`
-checks incorrectly suggested that #46 and current main were outside this
-range: the fork's `setup.py` uses a custom version scheme. Editable non-device
-builds of the exact sources produce
-`0.29.1.post1.dev463+gc2e9e7d53.empty` for #46 head and
-`0.29.1.post1.dev522+gc3e05329b.empty` for current main; both satisfy the
-range. Current-main version acceptance therefore needs no Manifest change.
-This is package metadata acceptance, not a complete core/Ascend runtime matrix.
-
-## Results
-
-- Host focused capability/observer/recovery/descriptor tests: 46 passed.
-- Full host offloading-connector CPU regression: 603 passed, 2 skipped.
-- Host observer/evidence follow-up: 28 focused tests passed; changed-file Ruff,
-  mypy, SPDX, forbidden-import, and repository hooks passed.
-- Extension tests: 146 passed; Ruff check and format passed.
-- Clean wheel: ECPA inspect/check/enable/plan/render completed from an isolated
-  Python 3.12 environment.
-- Installed-wheel host seam: one H2D submission and completion produced
-  `restore_started` and `restore_completed`; two bound runtime-effective host
-  receipts were delivered; unregister left no observer.
-- Before separation, current-main editable non-device builds in the isolated
-  CPU preflight environment passed core `c3e05329b7` observer/recovery tests
-  42/42 and Ascend `575bd1c265` native CPU-offload tests 13/13. The Ascend
-  package was subsequently removed to make the core-first environment's
-  dependency check pass; the Ascend source worktree remains available.
-- Plugin source tests pass 224/224; Ruff, format, sdist/wheel build, isolated
-  wheel install/removal, and the wheel-installed current-main observer smoke
-  pass. These checks exercise interface and packaging behavior, not serving.
-- With the plugin wheel and Extension Manager at pinned commit `5aa797cdc`
-  temporarily installed alongside current core main, `extension check`
-  reported `installed`, `discovered`, `compatible`, and `configured`. Its
-  evidence explicitly accepted host package version
-  `0.29.1.post1.dev522+gc3e05329b.empty` and observer API 1.0. The temporary
-  plugin/Manager installs were then removed. Repeating this check after
-  uninstalling Ascend produced the same four states; the core-first
-  environment also passed `uv pip check` with those tools installed.
-- The local `tools/smoke_current_host_observer.py` public-API smoke against
-  installed current core and plugin wheel wrote two canonical Worker-local
-  transfer events and four separately scoped host facts (requeue, receipt,
-  admission, first compute), then unregistered. Descriptor correlation remains
-  rejected. These callback objects are synthetic; no connector or model
-  executed.
-- Live-process rule: ECPA reported `runtime_effective` while the owning process
-  was alive and removed that state after the same process stopped.
-
-The CPU/host checks above started no model server, port, child worker, or
-accelerator. The separate one-tensor NPU access check below is not among them.
-
-To repeat the synthetic callback smoke with a CPU-capable environment that
-already has the host dependencies, run from this repository's root:
-
-```bash
-PYTHONPATH="$PWD/src" TORCH_DEVICE_BACKEND_AUTOLOAD=0 \
-  VLLM_TARGET_DEVICE=cpu VLLM_PLUGINS='' \
-  /root/kv-transfer-observability-workspace/runtime-candidate/.venv/bin/python \
-  tools/smoke_current_host_observer.py
-```
-
-The command relies on the isolated environment's editable current-main core
-build. It constructs public host callback records; it does not run KV copies.
-
-## Fail-closed boundary
-
-The active binding accepts Worker-local `transfer_submitted`,
-`transfer_completed`, and `transfer_cancelled` records. It also accepts the
-host's `transfer_receipt`, `recovery_requeued`, `recovery_admitted`, and
-`first_compute` callbacks as closed, bounded
-`vllm-hust.kv-transfer-host-fact.v1` records with explicit
-`host_reported_unjoined` scope. They do not satisfy the canonical v2 complete
-restore-chain validator. Unknown API versions, malformed identities, rosters,
-and field combinations are rejected; runtime callback errors remain fail-open.
-
-The follow-up binding generates a nonzero, per-process incarnation and keeps
-only bounded in-flight job associations. A rejected submission creates no
-association; a mismatched terminal record cannot close another request's job.
-The entry point releases completed H2D receipt state because it cannot safely
-join scheduler admissions to Worker restores. This allows long-running
-observation of transfer events and host facts without claiming a complete
-cross-process recovery chain. A process-local incarnation is not a
-host-supplied cross-process generation.
-
-At the 2026-10-08 read-only host main `c3e05329b7`, scheduler requeue and
-admission records carry request ID, epoch, and job roster, but no worker rank
-or generation. Worker transfer records carry job ID, rank, and request ID but
-no recovery epoch. Worker first-compute carries epoch, job roster and rank,
-but not the corresponding accepted per-worker transfer receipts. The copy
-site emits region-relative descriptors before the worker's submission event
-with `rank=None` and no request ID. Job IDs alone do not prove that these
-observations came from the same worker incarnation or recovery episode:
-scheduler job numbering restarts with a new connector instance. The plugin
-therefore keeps those paths detached under its strict per-Worker attribution
-model. The existing v1.0 scheduler and first-compute events can be represented
-as separate host observations without claiming that stronger join. Proving a
-single end-to-end chain across processes would require a verifiable bounded
-process/generation and episode association across scheduler, copy, and worker
-callbacks, plus exact Worker-incarnation receipt rosters. No timestamp or
-filename join is substituted for those facts. The host's current worker
-completion path also asserts success, so backend failure handling is not
-qualified by a successful CPU callback test.
-
-Ascend `575bd1c265` reuses the core `OffloadingConnectorWorker` through its
-native connector. Its V1 model runner overrides `execute_model` and does not
-call `observe_forward_batch` before `_model_forward`, so it cannot currently
-publish the host's first-compute callback through that path. Its V2 runner
-delegates to the core `GPUModelRunner.execute_model`, where the hook exists;
-that source relationship is not a runtime receipt. The Ascend native
-`cpu_npu.py` copy path has no corresponding region-layout publication.
-
-The plugin now consumes the already-published v1.0 scheduler and first-compute
-data as separate typed host facts. The reused job/rank tests demonstrate that
-these reports alone cannot prove which Worker incarnation performed a restore.
-A stronger per-Worker cross-process join would need the following additional
-facts:
-
-| Path | Required host fact | Current gap |
-|---|---|---|
-| Scheduler receipt/admission to Worker restore | Bounded origin/generation and recovery-episode association, with the exact accepted rank roster | Scheduler and Worker callbacks cannot prove the same incarnation and episode |
-| Copy descriptor to submitted transfer | Address-free request/rank/origin association and an ordering rule for accepted jobs | CPU copy-site descriptor precedes submission and lacks request/rank; native NPU copy site has no equivalent callback |
-| Ascend V1 first forward | Default-off forwarding of the existing `observe_forward_batch` hook at the real forward boundary | V1 override does not call it |
-| Backend failure | Terminal result that distinguishes failed transfer from success without changing serving safety | Current core Worker asserts success before publishing completion |
-
-Any expanded host contract needs its own version and focused CPU fixtures
-before the plugin consumes the new fields. This is a proposed stronger
-attribution requirement, not a claim that #46 failed to complete its agreed
-v1.0 scope. The plugin rejects the descriptor callback for lack of request/rank
-correlation and rejects malformed or unknown callbacks.
-
-A concrete versioned seam candidate is to issue one bounded scheduler
-incarnation ID when the connector is created, carry it through
-`OffloadingConnectorMetadata`, and include it in scheduler and Worker
-observations. `TransferJob` would carry the request's recovery epoch when the
-load belongs to an open recovery episode. Each Worker would issue its own
-bounded incarnation ID and echo it in completion metadata. The scheduler's
-accepted receipts and admission would report exact
-`(job ID, rank, Worker incarnation)` tuples. The admission metadata sent back
-to Workers would carry that accepted roster, and the first-compute callback
-would carry it with the same scheduler incarnation and epoch. The plugin could
-then reject any submission, receipt, admission, or first-compute record whose
-origin, episode, or roster differs; a reused numeric job ID after a restart
-would remain distinguishable without a clock or filename join. Descriptor
-records need the same origin/job/request/rank fields and an explicit ordering
-rule before they can be included. The plugin would bind this as a new host API
-version, keeping version 1.0's worker-local behavior separate. Required
-negative fixtures include reused job IDs across scheduler incarnations, rank
-reuse after Worker restart, incomplete receipt rosters, repeated recovery
-epochs, and delayed first-compute records. These fields were a proposal at
-the published v1 baseline; the uncommitted current-core follow-up above now
-implements the recovery identity path.
-
-The following are not qualified:
-
-- cross-process recovery admission and first-compute correlation;
-- descriptor capture from core or Ascend copy sites;
-- the Ascend V1 runner and `cpu_npu.py` follow-up call sites;
-- device transfer correctness, resource release, overhead, or performance.
-
-The target machine exposes an idle, healthy 910B2 and CANN 9.1.0. A separate
-Torch 2.13.0 CPU / TorchNPU 2.13.0rc1 process allocated one NPU tensor and
-read `[1.0]` back successfully. That is a device-access check, not a KV copy,
-model run, plugin activation, or validated runtime. Ascend main
-`575bd1c265` records upstream core `ced6857afa0e` as its verified commit,
-while the organization core at `c3e05329b7` is a different source revision.
-The isolated CPU preflight lacks pinned `triton-ascend==3.6.0`; the checked
-PyPI and Huawei Ascend indexes do not publish that version. Overlaying the
-two current source trees on the older CPU environment imports connector and
-spec modules. Direct imports of both runners hit an Ascend `DeviceOperator`
-initialization cycle. Importing `vllm_ascend.ops` first lets the V1 runner
-import, so that cycle is import-order dependent in this CPU preflight, not a
-proven NPU startup failure. With the same ordering, V2 fails because current
-core no longer has
-`vllm.v1.worker.gpu.spec_decode.autoregressive`. Replacing current core with
-Ascend's recorded verified commit instead fails V2 on its missing
-`prepare_dcp_local_seq_lens` symbol.
-
-For comparison only, the older core #46 head `c2e9e7d531` plus Ascend
-`575bd1c265` forms a narrower source-pair candidate. It is not selected under
-the current-core-main priority. That older core revision has
-both the old spec-decode path and the DCP helper. With `vllm_ascend.ops`
-imported first in the same CPU preflight environment, both V1 and V2 runner
-modules import. Core observer/recovery tests pass 42/42, Ascend native
-CPU-offload tests pass 13/13, the V2 speculator file passes 35/35, and the
-synthetic plugin callback smoke records two transfer events and unregisters.
-Initially the broader three-file V2 CPU mock suite passed 52/81: 28 cases
-constructed speculators without their initializer and omitted upstream
-`dcp_size`; one assigned the now read-only `dp_size` property. An isolated
-Ascend worktree at the same source commit changes only test fixtures: it
-supplies `dcp_size` and the builder's `supports_update_block_table`, derives
-`dp_size` from test config, and expects the upstream padded flag count. With
-those four test-only corrections, the same suite passes 81/81. The untouched
-Ascend source worktree remains at 52/81. Neither the fixed fixtures nor the
-passing imports establish model execution, KV transfer, or plugin callbacks
-on a device.
-
-Current organization core main and Ascend main were co-installed as editable
-non-device builds in the isolated CPU preflight environment. That verified
-package identity for source/CPU checks, but the pair failed dependency
-resolution: current core requires `transformers>=5.16.1,<5.20.0`, while
-Ascend main pins `transformers==5.14.1`; Ascend also pins the unavailable
-`triton-ascend==3.6.0`. The installed `transformers==5.19.0` satisfies core
-and conflicts with Ascend. Current core also lacks the older
-`vllm.v1.worker.gpu.spec_decode.autoregressive` module imported by Ascend V2.
-The alternative #46-head source pair passes the isolated import/CPU fixture
-checks above but is not the selected current-main baseline or a qualified NPU
-runtime. Ascend was then uninstalled from the isolated environment; with
-current core still installed, `uv pip check` passes for all 183 packages and
-the observer API still imports. The synthetic six-record callback smoke also
-passes after Ascend removal. This is a core-first CPU preflight, not an
-Ascend compatibility claim.
-
-## Core-first Ascend selection
-
-The selection target is fixed at organization core main `c3e05329b7`
-(`vllm 0.29.1.post1.dev522+gc3e05329b.empty`, Torch 2.13.0, Transformers
-`>=5.16.1,<5.20.0`). Switching only the Ascend checkout did not reveal a
-ready-to-run pair in the candidates inspected on 2026-10-08:
-
-| Ascend candidate | Concrete incompatibility with fixed core main |
-|---|---|
-| HUST main `575bd1c265` | Pins Transformers 5.14.1 and unavailable Triton Ascend 3.6.0; V2 imports the removed `gpu.spec_decode.autoregressive` path. |
-| HUST `feature/latest-main-compat` `b84e4fce` | Retains Transformers 5.14.1, Triton Ascend 3.6.0, and the removed import path. |
-| HUST `feat/kv-transfer-observability-call-sites` `3a5912bb` | Adds relevant observation call sites but retains the same dependency and V2 import mismatches. |
-| Upstream Ascend `releases/v0.29.0rc` `b3d3bb68` | Pins Transformers 5.14.1 and Torch 2.10.0, while fixed core requires Transformers at least 5.16.1 and Torch 2.13.0. |
-
-Those are source/dependency checks, not an exhaustive search of every remote
-branch. The latest HUST main is also still anchored to upstream core
-`ced6857afa0e`, rather than this organization's current core main. A
-compatible Ascend target therefore needs its own isolated candidate: align
-the dependency declarations to core, update the V2 imports and any changed
-interfaces, obtain a matching Triton Ascend build, then pass CPU runner and
-real NPU KV-transfer checks before advertising it. No plugin Manifest change
-is needed to make the fixed core version acceptable. No model service, real
-KV transfer, complete cross-process receipt, or plugin NPU observation has
-been demonstrated. Correctness and matched overhead measurements remain
-pending a runnable Ascend pair and identity-bearing host seam.
-
-These omissions are intentional. A scheduler job id is not treated as a
-process-scoped transfer identity, and historical B134 compatibility is not
-described as current native NPU validation.
+The local V1/Qwen3 single-device package pair now has installable versions,
+real recovery evidence and descriptor identity evidence. The next single-card
+checks are in-place Worker restart, long-running service teardown, and V2
+model-runner compatibility. Multi-rank testing is deferred for this stage.
+Complete the remaining fault and matched-performance gates in
+[Issue #2](https://github.com/vLLM-HUST/vllm-hust-kv-transfer-observability/issues/2).

@@ -3,10 +3,10 @@
 Use the installed package's schema and lifecycle checks before treating a
 capture as usable input. This validator accepts the canonical v2 event and
 region-descriptor formats emitted by this package, plus bounded
-`host_reported_unjoined` facts from the host v1.0 observer API. It does not
+`host_reported_unjoined` facts from the older host v1.0 observer API. It does not
 accept the old v1 vocabulary, or translate raw OffloadingConnector
 observations into missing worker/process identities.
-The local current-core v2 follow-up also emits closed
+Merged core PR #48 also emits closed
 `vllm-hust.kv-transfer-correlated-host.v2` records. For recovery spanning
 multiple process-local files, repeat `--events` once per file; total input is
 bounded to 64 MiB and 100,000 records.
@@ -59,14 +59,15 @@ scope instead of trimming a failing file until it passes.
 
 All regression fixtures are synthetic conformance evidence. Passing this
 command does not establish complete worker coverage, device execution,
-compatibility, or performance. Published core PR #46 and Manifest 0.3 expose
-v1 callbacks only for this purpose. The uncommitted local v2 host and plugin
-follow-up can write and validate correlated chains; one
-910B2/Ascend-V1/CPU-offload diagnostic produced two complete real recovery
-episodes. That experimental run does not qualify an installable host pairing,
-multi-rank or V2 execution, broader hardware correctness, or performance.
+compatibility, or performance. Core PR #46 supplies v1 callbacks; merged
+core #48 and plugin #12 add correlated v2 records. One 910B2/Ascend-V1/
+CPU-offload run produced two complete real recovery episodes. The subsequent
+locally adapted clean-wheel pairing also passes real recovery and dependency
+checks; see [current host compatibility](current_host_compatibility.md).
+Multi-rank or V2-runner execution, broader hardware correctness, and
+performance remain unqualified. The v2 event protocol is distinct from
+the V2 model runner.
 
-This implementation addresses the stale-schema and false-positive findings
-in the proposed toolkit PR #9. That PR has not been merged here: use this
-package command instead of its older `verify_events.py`. Its package/device
-scripts and the operational claims in PR #8 need separate review.
+Use this package command instead of the historical `verify_events.py` in the
+merged PR #9 toolkit: the latter checks an older schema and cannot certify a
+v2 recovery chain. Package/device acceptance remains a separate check.
