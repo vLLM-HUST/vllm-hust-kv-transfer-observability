@@ -2,6 +2,7 @@ import importlib
 from pathlib import Path
 
 from vllm_hust_ext.manifest import activation_blocker, load_manifest
+from vllm_hust_ext.providers.base import assess_compatibility
 
 import vllm_hust_kv_transfer_observability
 
@@ -21,7 +22,12 @@ def test_manifest_declares_one_active_versioned_carrier() -> None:
     }
     assert protocols == {
         "vllm.general_plugins": None,
-        "vllm.kv-transfer.observer": ">=1,<2",
+        "vllm.kv-transfer.observer": "==1.1",
+    }
+    assert dict(manifest.activation.environment) == {
+        "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVENT_PATH": "",
+        "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_DESCRIPTOR_DIR": "",
+        "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVIDENCE_LABEL": "",
     }
     entry_points = [
         (entry.group, entry.name) for entry in manifest.activation.entry_points
@@ -50,3 +56,27 @@ def test_resource_claim_is_shared_and_process_scoped() -> None:
     assert claim.resource == "vllm.kv-transfer.observer"
     assert claim.scope == "vllm-process"
     assert claim.mode == "shared"
+
+
+def test_manifest_rejects_host_observer_v1_0_before_activation() -> None:
+    manifest = load_manifest(MANIFEST_PATH)
+    kwargs = {
+        "detected_host_version": "0.29.1",
+        "default_api_version": "1.0",
+    }
+
+    incompatible, _ = assess_compatibility(
+        manifest,
+        {},
+        default_protocol_versions={"vllm.kv-transfer.observer": "1.0"},
+        **kwargs,
+    )
+    compatible, _ = assess_compatibility(
+        manifest,
+        {},
+        default_protocol_versions={"vllm.kv-transfer.observer": "1.1"},
+        **kwargs,
+    )
+
+    assert incompatible is False
+    assert compatible is True

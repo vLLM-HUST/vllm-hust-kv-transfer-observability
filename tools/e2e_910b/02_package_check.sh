@@ -1,45 +1,56 @@
 #!/usr/bin/env bash
-# Tier 1: 包级验证 —— 910B 上安装 + 全测试 + CLI 门禁。
-# 用法: bash 02_package_check.sh | tee pkg_result.txt
+# Tier 1: verify a built wheel in an isolated Python environment with a real host.
 set -euo pipefail
 
-echo "===== [1/4] 安装 kv-transfer-observability（本地 wheel 或 git）====="
-PKG_REF="${1:-git+https://github.com/vLLM-HUST/vllm-hust-kv-transfer-observability.git@main}"
-python3 -m pip install "vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@main"
-python3 -m pip install "$PKG_REF"
-
-echo ""
-echo "===== [2/4] 包内测试 ====="
-python3 -m pip install pytest ruff
-python3 -m pytest -q --pyargs vllm_hust_kv_transfer_observability 2>&1 || \
-python3 -m pytest -q 2>&1 || echo "pytest 收集失败（包内测试路径见上）"
-
-echo ""
-echo "===== [3/4] CLI 发现/门禁 ====="
-vllm-hust-ext extension inspect org.vllm-hust.kv-transfer-observability | head -5
-vllm-hust-ext extension check org.vllm-hust.kv-transfer-observability | head -8
-echo "--- enable 应失败（import_only 门禁）---"
-if vllm-hust-ext extension enable org.vllm-hust.kv-transfer-observability 2>&1; then
-  echo "!! 意外：enable 成功 —— 门禁失效，立即报告"
-  exit 1
-else
-  echo "OK: enable 被正确拒绝"
+if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+  printf 'Usage: KV_OBSERVER_PYTHON=/path/to/venv/bin/python %s /path/to/plugin.whl\n' "$0" >&2
+  exit 2
 fi
 
-echo ""
-echo "===== [4/4] 运行时零副作用冒烟（不 import vllm）====="
-TMPD=$(mktemp -d)
-python3 - "$TMPD" <<'PY'
-import sys, os
-from vllm_hust_kv_transfer_observability import JsonlKVTransferEventSink
-d = sys.argv[1]
-sink = JsonlKVTransferEventSink(None)          # 禁用
-sink.emit("preempt", "req-1")                   # 必须无副作用
-sink.close()
-assert os.listdir(d) == [], f"禁用 sink 产生了文件: {os.listdir(d)}"
-print("OK: 禁用 sink 零副作用")
-PY
-rm -rf "$TMPD"
+: "${KV_OBSERVER_PYTHON:?Set KV_OBSERVER_PYTHON to an isolated venv Python}"
+PYTHON_BIN=$KV_OBSERVER_PYTHON
+UV_BIN=${KV_OBSERVER_UV:-uv}
+WHEEL=$(realpath "$1")
+EXTENSION_ID=org.vllm-hust.kv-transfer-observability
+MANAGER_REF=${KV_OBSERVER_MANAGER_REF:-'vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@5aa797cdc80d2d628b8f0e1548c53ff484df534b'}
 
-echo ""
-echo "===== package check done ====="
+"$UV_BIN" pip install --python "$PYTHON_BIN" "$MANAGER_REF" "$WHEEL"
+"$UV_BIN" pip check --python "$PYTHON_BIN"
+CLI_DIR=$("$PYTHON_BIN" -c 'import os, sys; print(os.path.dirname(sys.executable))')
+CLI="$CLI_DIR/vllm-hust-ext"
+
+RESULT_TMP=$(mktemp -d)
+trap 'rm -rf "$RESULT_TMP"' EXIT
+export XDG_CONFIG_HOME="$RESULT_TMP/config"
+export XDG_DATA_HOME="$RESULT_TMP/data"
+
+"$CLI" extension inspect "$EXTENSION_ID" | tee "$RESULT_TMP/inspect.json"
+"$PYTHON_BIN" - "$RESULT_TMP/inspect.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    record = json.load(stream)
+if record["enabled"] is not False:
+    raise SystemExit("wheel installation unexpectedly enabled the plugin")
+if record["activation_ready"] is not True:
+    raise SystemExit("installed wheel is not activatable")
+PY
+
+"$CLI" extension check "$EXTENSION_ID" | tee "$RESULT_TMP/check.json"
+"$PYTHON_BIN" - "$RESULT_TMP/check.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    states = set(json.load(stream)["states"])
+if not {"installed", "discovered", "compatible", "configured"} <= states:
+    raise SystemExit(f"host capability check is incomplete: {sorted(states)}")
+if "degraded" in states:
+    raise SystemExit("host capability check is degraded")
+PY
+
+"$CLI" extension enable "$EXTENSION_ID"
+"$CLI" extension plan "$EXTENSION_ID"
+"$CLI" extension render "$EXTENSION_ID"
+"$CLI" extension disable "$EXTENSION_ID"

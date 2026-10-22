@@ -16,6 +16,8 @@ from .native import VllmOffloadingObserverBinding
 EXTENSION_ID = "org.vllm-hust.kv-transfer-observability"
 PLUGIN_NAME = "kv_transfer_observability"
 EVENT_PATH_ENV = "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVENT_PATH"
+DESCRIPTOR_DIR_ENV = "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_DESCRIPTOR_DIR"
+EVIDENCE_LABEL_ENV = "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVIDENCE_LABEL"
 _ENABLED_BUNDLES_ENV = "VLLMHUST_EXT_ENABLED_BUNDLES"
 _VLLM_PLUGINS_ENV = "VLLM_PLUGINS"
 
@@ -83,7 +85,16 @@ def register_plugin() -> None:
     if process_id == _REGISTERED_PID or not _activation_requested():
         return
 
-    config = ObserverConfig(enabled=True, event_path=_event_path())
+    descriptor_dir = os.getenv(DESCRIPTOR_DIR_ENV)
+    evidence_label = os.getenv(EVIDENCE_LABEL_ENV)
+    config = ObserverConfig.from_mapping(
+        {
+            "enabled": True,
+            "event_path": str(_event_path()),
+            **({"descriptor_dir": descriptor_dir} if descriptor_dir else {}),
+            **({"evidence_label": evidence_label} if evidence_label else {}),
+        }
+    )
     binding = VllmOffloadingObserverBinding()
     # Worker-local transfers normalize to canonical events; recovery and
     # first-compute callbacks remain separate, unjoined host facts. Keeping

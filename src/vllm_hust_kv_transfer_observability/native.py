@@ -14,6 +14,7 @@ from .correlated import (
     JobReceipt,
     WorkerReceipt,
 )
+from .descriptors import MAX_DESCRIPTOR_REGIONS, DescriptorInventory, DescriptorRegion
 from .host_facts import HostFact, HostFactEvent
 from .normalization import (
     DEFAULT_MAX_CORRELATED_TRANSFERS,
@@ -29,11 +30,12 @@ from .schema import (
     ObservationIdentity,
     ReceiptIdentity,
     RecoveryRequeueReason,
+    TransferDirection,
     TransferIdentity,
     TransferTerminalReason,
 )
 
-REQUIRED_HOST_API_VERSION = "1.0"
+REQUIRED_HOST_API_VERSION = "1.1"
 CORRELATED_HOST_CONTRACT = "vllm.kv-transfer.observer.v2"
 CORRELATED_HOST_API_VERSION = "2.0"
 MAX_BINDING_TRANSFERS = DEFAULT_MAX_CORRELATED_TRANSFERS
@@ -81,8 +83,11 @@ class VllmOffloadingObserverBinding:
         self._worker_generation = int(self._process_uuid[:16], 16) or 1
         self._callbacks: HostObserverCallbacks | None = None
         self._pending: dict[
-            int, tuple[ObservationIdentity, TransferIdentity, TransferOperation]
+            int,
+            tuple[ObservationIdentity, TransferIdentity, TransferOperation, str | None],
         ] = {}
+        self._descriptor_seen: set[int] = set()
+        self._next_transfer = 0
         self._state_lock = Lock()
 
     def register(self, callbacks: HostObserverCallbacks) -> object:
@@ -112,6 +117,7 @@ class VllmOffloadingObserverBinding:
         with self._state_lock:
             self._callbacks = None
             self._pending.clear()
+            self._descriptor_seen.clear()
         if self._correlated_handle is not None:
             assert self._correlated_api is not None
             try:
@@ -180,8 +186,11 @@ class VllmOffloadingObserverBinding:
         except ValueError:
             return None
 
-    def _transfer(self, job_id: int) -> TransferIdentity:
-        return TransferIdentity(f"{self._process_uuid}:t:{job_id}")
+    def _transfer(self) -> TransferIdentity:
+        with self._state_lock:
+            sequence = self._next_transfer
+            self._next_transfer += 1
+        return TransferIdentity(f"{self._process_uuid}:t:{sequence}")
 
     def _operation(self, record: Any) -> TransferOperation | None:
         value = getattr(getattr(record, "operation", None), "value", None)
@@ -203,18 +212,30 @@ class VllmOffloadingObserverBinding:
         job_id = getattr(record, "job_id", None)
         operation = self._operation(record)
 
+        if event == "transfer_descriptors":
+            return self._observe_descriptors(record)
+
         if event == "transfer_submitted":
             identity = self._identity(record)
+            token = getattr(record, "submission_token", None)
             if (
                 identity is None
                 or operation is None
                 or type(getattr(record, "block_count", None)) is not int
+                or (
+                    token is not None
+                    and (
+                        type(token) is not str
+                        or len(token) != 32
+                        or any(c not in "0123456789abcdef" for c in token)
+                    )
+                )
             ):
                 return False
             try:
                 source = CoreTransferSubmitted(
                     identity=identity,
-                    transfer=self._transfer(job_id),
+                    transfer=self._transfer(),
                     operation=operation,
                     block_count=record.block_count,
                     observed_at_ns=record.observed_at_ns,
@@ -234,7 +255,12 @@ class VllmOffloadingObserverBinding:
                 except Exception:
                     return False
                 if accepted:
-                    self._pending[job_id] = (identity, source.transfer, operation)
+                    self._pending[job_id] = (
+                        identity,
+                        source.transfer,
+                        operation,
+                        token,
+                    )
                 return accepted
 
         if event not in {"transfer_completed", "transfer_cancelled"}:
@@ -244,17 +270,18 @@ class VllmOffloadingObserverBinding:
             pending = self._pending.get(job_id)
             if callbacks is None or pending is None or operation is None:
                 return False
-            identity, transfer, submitted_operation = pending
+            identity, transfer, submitted_operation, token = pending
             if (
                 operation is not submitted_operation
                 or getattr(record, "request_id", None) != identity.request_id
                 or getattr(record, "rank", None) != identity.rank
+                or getattr(record, "submission_token", None) != token
             ):
                 return False
             try:
                 if event == "transfer_completed":
                     receipt = (
-                        ReceiptIdentity(f"{self._process_uuid}:k:{job_id}")
+                        ReceiptIdentity(transfer.value.replace(":t:", ":k:", 1))
                         if operation is TransferOperation.H2D_RESTORE
                         and record.success is True
                         else None
@@ -289,6 +316,65 @@ class VllmOffloadingObserverBinding:
             except Exception:
                 accepted = False
             del self._pending[job_id]
+            self._descriptor_seen.discard(job_id)
+            return accepted
+
+    def _observe_descriptors(self, record: Any) -> bool:
+        """Accept only a complete layout for this exact active submission."""
+        job_id = getattr(record, "job_id", None)
+        if type(job_id) is not int:
+            return False
+        with self._state_lock:
+            pending = self._pending.get(job_id)
+            callbacks = self._callbacks
+            if (
+                pending is None
+                or callbacks is None
+                or callbacks.descriptor is None
+                or job_id in self._descriptor_seen
+            ):
+                return False
+            identity, transfer, operation, token = pending
+            regions = getattr(record, "descriptors", None)
+            if (
+                token is None
+                or getattr(record, "submission_token", None) != token
+                or self._identity(record) != identity
+                or self._operation(record) != operation
+                or getattr(record, "dropped_descriptors", None) != 0
+                or type(regions) is not tuple
+                or not 0 < len(regions) <= MAX_DESCRIPTOR_REGIONS
+            ):
+                return False
+            direction = (
+                TransferDirection.D2H
+                if operation is TransferOperation.D2H_PRESERVE
+                else TransferDirection.H2D
+            )
+            try:
+                inventory = DescriptorInventory(
+                    identity=identity,
+                    transfer=transfer,
+                    job_id=job_id,
+                    direction=direction,
+                    observed_at_ns=record.observed_at_ns,
+                    regions=tuple(
+                        DescriptorRegion(
+                            src_offset=r.src_offset,
+                            dst_offset=r.dst_offset,
+                            size=r.size,
+                            direction=direction,
+                            src_region_id=r.src_region_id,
+                            dst_region_id=r.dst_region_id,
+                        )
+                        for r in regions
+                    ),
+                )
+                accepted = callbacks.descriptor(inventory) is True
+            except Exception:
+                return False
+            if accepted:
+                self._descriptor_seen.add(job_id)
             return accepted
 
     def _observe_host_fact(self, record: Any, event: HostFactEvent) -> bool:

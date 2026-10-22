@@ -1,11 +1,15 @@
 # Minimal current-host seam for KV lifecycle observations
 
-> Historical design record (2026-09-28). The worker-local subset is now wired
-> by Manifest 0.3 against vLLM-HUST PR #46. Statements below that the whole
-> package must remain `import_only` describe the earlier state; the documented
-> recovery and descriptor limitations still apply.
+> Historical design record (2026-09-28). Core PRs
+> [#46](https://github.com/vLLM-HUST/vllm-hust/pull/46) and
+> [#48](https://github.com/vLLM-HUST/vllm-hust/pull/48) have since merged.
+> Manifest 0.3 is explicitly activatable and the local v1.1 follow-up binds
+> copy-site layouts to accepted Worker submissions. Use
+> [current host compatibility](current_host_compatibility.md) for the tested
+> pairing and remaining limits; the missing-seam and `import_only` statements
+> below describe the earlier audit only.
 
-Status: proposal for maintainer review; not an implemented or accepted host API.
+Status of the following text: historical proposal, not the current host API.
 
 This document narrows the host work required by Issue #2 after checking the
 current host implementations. It does not activate the plugin, patch a host,
