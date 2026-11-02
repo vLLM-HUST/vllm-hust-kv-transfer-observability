@@ -1,5 +1,31 @@
 # Current-host compatibility
 
+## Machine-checked compatibility matrix
+
+[`compatibility_matrix.json`](compatibility_matrix.json) is the single place
+where combination status is recorded, for the six dimensions the maintenance
+issue names: vLLM host, vLLM Ascend, Python, hardware, model, and features.
+Each cell carries exactly one state:
+
+| State | Meaning |
+|---|---|
+| `verified` | A repeatable check in this repository or its CI exercises the cell. |
+| `accepted` | Declared by the manifest or packaging metadata and enforced fail-closed; not a runtime claim. |
+| `diagnostic` | Observed once on real hardware in a local, unmerged pairing. Not a qualification. |
+| `unqualified` | No evidence. The combination must not be described as compatible. |
+
+`tests/test_compatibility_matrix.py` pins the matrix to its sources of truth:
+the manifest's host and protocol ranges, `pyproject.toml`'s `requires-python`,
+and the CI Python matrix. Every row must also name an existing reference file
+and either evidence or an explicit unqualified reason, so a stale or
+unsupported claim fails CI instead of living only in prose.
+
+Today the matrix records one accepted host range, three verified Python
+versions, four verified feature areas, one single-card Ascend diagnostic, and
+explicitly unqualified cells for every Ascend source candidate, multi-card
+deployment, non-dense model, v2 chain, and descriptor capture. The diagnostic
+probes below do not upgrade any of those cells.
+
 ## Local 910B2 NPU diagnostic (2026-10-08, uncommitted)
 
 The selected baseline remains organization core main `c3e05329b7` with the
@@ -13,8 +39,10 @@ change matches the intent of collaborator branch
 Ascend main. The plugin was installed from this worktree's locally built wheel.
 All of this remains local; the original Ascend worktree is unchanged.
 
-This is an **experimental single-model pairing**, not a resolved package
-compatibility matrix. The candidate uses Python 3.12, Torch 2.13.0+cpu,
+This diagnostic is a `diagnostic` row in the
+[compatibility matrix](compatibility_matrix.json): an **experimental
+single-model pairing**, not a resolved package compatibility matrix. The
+candidate uses Python 3.12, Torch 2.13.0+cpu,
 TorchNPU 2.13.0rc1, Transformers 5.19.0, CANN 9.1.0, and the available
 Triton-Ascend 3.2.2 on a 910B2. Ascend still declares Transformers 5.14.1
 and Triton-Ascend 3.6.0. The latter was not found in the checked package

@@ -29,8 +29,10 @@ narrow:
 The published v1-only carrier cannot prove a cross-process recovery roster.
 The local v2 follow-up adds that proof path. A single-card 910B2 diagnostic
 also observed real CPU KV offload and restore, including two complete
-preemption/recovery episodes under pressure. This is a narrow experimental
-pairing, not a qualified Ascend installation or compatibility matrix.
+preemption/recovery episodes under pressure. That is a narrow experimental
+pairing and a `diagnostic` row, not a qualified Ascend installation; every
+combination's state is recorded in
+[docs/compatibility_matrix.json](docs/compatibility_matrix.json).
 Descriptor capture, broader device correctness, failure handling, and
 performance remain separate gates. Successful
 installation, enable intent, runtime observation, and performance evidence are
