@@ -1,0 +1,170 @@
+{
+  "schema_version": "vllm-hust-compatibility-matrix-v1",
+  "matrix_id": "org.vllm-hust.kv-transfer-observability/compatibility",
+  "issue": "vLLM-HUST/vllm-hust-kv-transfer-observability#2",
+  "scope": "Which vLLM, vLLM Ascend, Python, hardware, model, and feature combinations this extension has evidence for. A row is a support claim only when its state is 'verified' or 'accepted'.",
+  "states": {
+    "verified": "A repeatable check in this repository or its CI exercises this cell.",
+    "accepted": "Declared in the package manifest or packaging metadata and enforced fail-closed. Package-level acceptance, not a runtime claim.",
+    "diagnostic": "Observed once on real hardware in a local, unmerged pairing. Not a qualification.",
+    "unqualified": "No evidence. The combination must not be described as compatible."
+  },
+  "dimensions": [
+    "host",
+    "host-api",
+    "python",
+    "ascend",
+    "hardware",
+    "model",
+    "feature"
+  ],
+  "rows": [
+    {
+      "dimension": "host",
+      "value": "vllm >=0.29.1,<0.30",
+      "state": "accepted",
+      "evidence": "Manifest 0.3 host.version_range. ECPA `extension check` accepted 0.29.1.post1.dev522+gc3e05329b.empty on 2026-10-08 (CPU preflight, no model server). Versions outside the range are refused by the extension manager.",
+      "reference": "src/vllm_hust_kv_transfer_observability/vllm-hust-extension-v0.3.json"
+    },
+    {
+      "dimension": "host-api",
+      "value": "vllm.kv-transfer.observer >=1,<2",
+      "state": "accepted",
+      "evidence": "Manifest protocol range plus the host capability-registry check. Unknown API versions fail closed (tests/test_native.py::test_binding_fails_closed_on_unknown_host_api).",
+      "reference": "tests/test_native.py"
+    },
+    {
+      "dimension": "host-api",
+      "value": "vllm.kv-transfer.observer.v2 (local follow-up seam)",
+      "state": "unqualified",
+      "reason": "Uncommitted and unpublished. The manifest requires only v1, so no installed host can produce a v2 chain; a v1 host yields Worker-local records only.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "python",
+      "value": "3.10",
+      "state": "verified",
+      "evidence": "CI `package` job: ruff, pytest, wheel build, clean-wheel install, and ECPA inspect/check/enable/plan/render.",
+      "reference": ".github/workflows/ci.yml"
+    },
+    {
+      "dimension": "python",
+      "value": "3.12",
+      "state": "verified",
+      "evidence": "CI `package` job: ruff, pytest, wheel build, clean-wheel install, and ECPA inspect/check/enable/plan/render.",
+      "reference": ".github/workflows/ci.yml"
+    },
+    {
+      "dimension": "python",
+      "value": "3.14",
+      "state": "verified",
+      "evidence": "CI `package` job: ruff, pytest, wheel build, clean-wheel install, and ECPA inspect/check/enable/plan/render.",
+      "reference": ".github/workflows/ci.yml"
+    },
+    {
+      "dimension": "python",
+      "value": "<3.10",
+      "state": "unqualified",
+      "reason": "requires-python is \">=3.10\"; the installer refuses this range and no test run exists.",
+      "reference": "pyproject.toml"
+    },
+    {
+      "dimension": "ascend",
+      "value": "vLLM Ascend main 575bd1c265",
+      "state": "unqualified",
+      "reason": "Pins transformers 5.14.1 and the unavailable triton-ascend 3.6.0, and its V2 runner imports the removed vllm.v1.worker.gpu.spec_decode.autoregressive.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "ascend",
+      "value": "vLLM Ascend feature/latest-main-compat b84e4fce",
+      "state": "unqualified",
+      "reason": "Retains transformers 5.14.1, triton-ascend 3.6.0, and the removed V2 import path.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "ascend",
+      "value": "vLLM Ascend feat/kv-transfer-observability-call-sites 3a5912bb",
+      "state": "unqualified",
+      "reason": "Adds observation call sites but keeps the same dependency pins and the removed V2 import path.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "ascend",
+      "value": "upstream vLLM Ascend releases/v0.29.0rc b3d3bb68",
+      "state": "unqualified",
+      "reason": "Pins transformers 5.14.1 and torch 2.10.0, while the fixed core main requires transformers >=5.16.1 and torch 2.13.0.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "hardware",
+      "value": "Ascend 910B2, one card, CANN 9.1.0",
+      "state": "diagnostic",
+      "evidence": "2026-10-08 local probe: CPU offload/restore produced identical token IDs; 30 records under an 80 MiB preemption workload; two complete v2 restore episodes for one request. Single card, one model, local unmerged host changes.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "hardware",
+      "value": "multi-card / multi-rank",
+      "state": "unqualified",
+      "reason": "No multi-rank receipt aggregation and no multi-card run; the published v1 seam also lacks a shared cross-process identity.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "model",
+      "value": "Qwen3-0.6B, dense, Ascend V1 runner",
+      "state": "diagnostic",
+      "evidence": "Same 2026-10-08 probe: the model loaded on NPU, generated two tokens, and restored KV with identical output digests.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "model",
+      "value": "other models, MoE, Ascend V2 runner",
+      "state": "unqualified",
+      "reason": "No run. The Ascend V1 runner does not call observe_forward_batch, so first-compute cannot be published there.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "feature",
+      "value": "activation only after explicit intent (ECPA enable or VLLM_PLUGINS)",
+      "state": "verified",
+      "evidence": "tests/test_plugin.py::test_plugin_is_inert_without_explicit_activation and tests/test_manifest.py, run by CI on 3.10, 3.12, and 3.14.",
+      "reference": "tests/test_plugin.py"
+    },
+    {
+      "dimension": "feature",
+      "value": "worker-local submit/complete/cancel into the bounded JSONL sink",
+      "state": "verified",
+      "evidence": "tests/test_event_sink.py, tests/test_normalization.py, and tests/test_native.py.",
+      "reference": "tests/test_event_sink.py"
+    },
+    {
+      "dimension": "feature",
+      "value": "host receipt, recovery, and first-compute recorded as closed, unjoined v1 facts",
+      "state": "verified",
+      "evidence": "tests/test_native.py::test_host_v1_recovery_facts_are_recorded_without_false_chain and tests/test_validation.py::test_unjoined_host_fact_roundtrips_but_cannot_complete_chain.",
+      "reference": "tests/test_native.py"
+    },
+    {
+      "dimension": "feature",
+      "value": "config schema, unknown-config rejection, and offline wheel uninstall",
+      "state": "verified",
+      "evidence": "tests/test_config.py, tests/test_validation.py, and tools/check_wheel_uninstall.py validate configuration and package removal in a disposable environment. They do not qualify live observer disable, runtime rollback, or recovery.",
+      "reference": "tests/test_config.py"
+    },
+    {
+      "dimension": "feature",
+      "value": "complete cross-process v2 restore chain",
+      "state": "unqualified",
+      "reason": "Requires the unmerged v2 host seam. Published v1 callbacks cannot join scheduler and Worker identities, and no timestamp or filename join is substituted.",
+      "reference": "docs/current_host_compatibility.md"
+    },
+    {
+      "dimension": "feature",
+      "value": "descriptor-layout capture",
+      "state": "unqualified",
+      "reason": "Copy sites emit region-relative descriptors without request or rank identity and without an ordering rule, so the binding rejects them.",
+      "reference": "docs/current_host_compatibility.md"
+    }
+  ]
+}
