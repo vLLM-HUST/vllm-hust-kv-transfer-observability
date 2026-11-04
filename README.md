@@ -60,6 +60,45 @@ system temporary directory. Set
 `VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVENT_PATH` through the extension's saved
 environment configuration to select an existing writable parent directory.
 
+## Stopping, disabling, and uninstalling
+
+Saved intent and a running process are separate things. Disabling never reaches
+into a process that is already running, and stopping a process never rewrites
+saved intent.
+
+```bash
+# 1. stop recording intent for subsequent launches
+vllm-hust-ext extension disable org.vllm-hust.kv-transfer-observability
+
+# 2. stop a running observer
+#    the host owns the process; terminate the vLLM process through your normal
+#    supervisor. The plugin's idempotent stop_plugin() unregisters the observer
+#    and closes plugin-owned writer threads. The JSONL file is left in place.
+
+# 3. drop the stored intent and configuration
+vllm-hust-ext extension forget org.vllm-hust.kv-transfer-observability
+
+# 4. remove the package
+python -m pip uninstall -y vllm-hust-kv-transfer-observability
+```
+
+`forget` refuses while the extension is still enabled, so disable first. Do not
+skip step 1 before step 4: an enabled bundle that no longer resolves makes
+`check` fail closed, which is the intended behaviour but leaves the environment
+in a self-inflicted broken state.
+
+Boundaries:
+
+- Package removal runs on every CI build through
+  `tools/check_wheel_uninstall.py`: it installs the built wheel into a
+  disposable offline venv and asserts that both entry points
+  (`vllm_hust.extension_bundles`, `vllm.general_plugins`) and the module
+  disappear after `pip uninstall`. That is **package removal evidence, not live
+  observer disable/rollback evidence**.
+- There is no rollback command. Rolling back means returning to a known-good
+  host/extension pair: disable, install the older wheel, then re-run `check`,
+  `plan`, and `render` and confirm `status`.
+
 ## Failure and identity boundaries
 
 The host callback never serializes or performs file I/O. The plugin uses
