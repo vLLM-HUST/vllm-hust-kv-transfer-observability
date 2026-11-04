@@ -147,9 +147,9 @@
     },
     {
       "dimension": "feature",
-      "value": "config schema, unknown-config rejection, disable, rollback, and uninstall",
+      "value": "config schema, unknown-config rejection, and offline wheel uninstall",
       "state": "verified",
-      "evidence": "tests/test_config.py, tests/test_validation.py, and tools/check_wheel_uninstall.py (the CI step 'Verify wheel uninstall in a disposable environment').",
+      "evidence": "tests/test_config.py, tests/test_validation.py, and tools/check_wheel_uninstall.py validate configuration and package removal in a disposable environment. They do not qualify live observer disable, runtime rollback, or recovery.",
       "reference": "tests/test_config.py"
     },
     {
