@@ -8,6 +8,32 @@ v2 scheduler/Worker generation and recovery-roster protocol. Merged
 consumes those protocols. The v1-only path still writes separately scoped
 host facts; it cannot attest a cross-process restore chain.
 
+## Machine-checked compatibility matrix
+
+[`compatibility_matrix.json`](compatibility_matrix.json) is the single place
+where combination status is recorded, for the six dimensions the maintenance
+issue names: vLLM host, vLLM Ascend, Python, hardware, model, and features.
+Each cell carries exactly one state:
+
+| State | Meaning |
+|---|---|
+| `verified` | A repeatable check in this repository or its CI exercises the cell. |
+| `accepted` | Declared by the manifest or packaging metadata and enforced fail-closed; not a runtime claim. |
+| `diagnostic` | Observed once on real hardware in a local, unmerged pairing. Not a qualification. |
+| `unqualified` | No evidence. The combination must not be described as compatible. |
+
+`tests/test_compatibility_matrix.py` pins the matrix to its sources of truth:
+the manifest's host and protocol ranges, `pyproject.toml`'s `requires-python`,
+and the CI Python matrix. Every row must also name an existing reference file
+and either evidence or an explicit unqualified reason, so a stale or
+unsupported claim fails CI instead of living only in prose.
+
+Today the matrix records one accepted host range, the exact accepted v1.1
+observer API, three verified Python versions, the verified v2 and descriptor
+identity contracts, and a bounded single-card Ascend diagnostic. Ascend source
+candidates, multi-card deployment, non-dense models, and production-grade v2
+or descriptor qualification remain explicitly unqualified.
+
 ## Exact checked baseline
 
 ### Clean package pairing (supersedes the diagnostic packaging gaps below)
