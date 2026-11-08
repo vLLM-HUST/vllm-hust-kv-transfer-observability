@@ -17,7 +17,7 @@
   "lifecycle_owner": "vllm",
   "protocols": [
     {"name": "vllm.general_plugins", "version_range": null},
-    {"name": "vllm.kv-transfer.observer", "version_range": ">=1,<2"}
+    {"name": "vllm.kv-transfer.observer", "version_range": "==1.1"}
   ],
   "components": [
     {
@@ -51,7 +51,9 @@
       {"group": "vllm.general_plugins", "name": "kv_transfer_observability"}
     ],
     "environment": {
-      "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVENT_PATH": ""
+      "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVENT_PATH": "",
+      "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_DESCRIPTOR_DIR": "",
+      "VLLM_HUST_KV_TRANSFER_OBSERVABILITY_EVIDENCE_LABEL": ""
     },
     "additional_config": {}
   }

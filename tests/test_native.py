@@ -45,7 +45,7 @@ class Value(str, Enum):
 
 class FakeHost:
     KV_TRANSFER_OBSERVER_CONTRACT = "vllm.kv-transfer.observer.v1"
-    KV_TRANSFER_OBSERVABILITY_API_VERSION = "1.0"
+    KV_TRANSFER_OBSERVABILITY_API_VERSION = "1.1"
 
     def __init__(self) -> None:
         self.callback = None
@@ -74,6 +74,7 @@ def record(event: Value, **changes):
         "duration_ns": None,
         "reason": None,
         "observed_at_ns": 10,
+        "submission_token": None,
     }
     values.update(changes)
     return SimpleNamespace(**values)
@@ -111,6 +112,72 @@ def test_binding_translates_worker_submit_and_completion() -> None:
     binding.unregister(handle)
     assert host.unregistered is host.handle
     assert host.callback(record(Value.SUBMITTED)) is False
+
+
+def test_descriptor_requires_and_reuses_exact_submission_identity() -> None:
+    host = FakeHost()
+    binding = VllmOffloadingObserverBinding(host)
+    events = []
+    inventories = []
+    binding.register(
+        HostObserverCallbacks(
+            lambda item: events.append(item) or True,
+            lambda item: inventories.append(item) or True,
+        )
+    )
+    token = "a" * 32
+    assert host.callback(record(Value.SUBMITTED, submission_token=token)) is True
+    descriptor = SimpleNamespace(
+        src_region_id=0,
+        dst_region_id=1,
+        src_offset=32,
+        dst_offset=64,
+        size=128,
+    )
+    assert (
+        host.callback(
+            record(
+                Value.DESCRIPTORS,
+                submission_token=token,
+                descriptors=(descriptor,),
+                dropped_descriptors=0,
+            )
+        )
+        is True
+    )
+    assert len(inventories) == 1
+    inventory = inventories[0]
+    assert inventory.identity == events[0].identity
+    assert inventory.transfer == events[0].transfer
+    assert inventory.job_id == 7
+    assert inventory.regions[0].size == 128
+
+
+def test_descriptor_rejects_wrong_or_replayed_submission_token() -> None:
+    host = FakeHost()
+    binding = VllmOffloadingObserverBinding(host)
+    inventories = []
+    binding.register(
+        HostObserverCallbacks(
+            lambda _item: True, lambda item: inventories.append(item) or True
+        )
+    )
+    token = "a" * 32
+    assert host.callback(record(Value.SUBMITTED, submission_token=token)) is True
+    descriptor = SimpleNamespace(
+        src_region_id=0, dst_region_id=1, src_offset=0, dst_offset=0, size=1
+    )
+    layout = record(
+        Value.DESCRIPTORS,
+        submission_token="b" * 32,
+        descriptors=(descriptor,),
+        dropped_descriptors=0,
+    )
+    assert host.callback(layout) is False
+    layout.submission_token = token
+    assert host.callback(layout) is True
+    assert host.callback(layout) is False
+    assert len(inventories) == 1
 
 
 def test_rejected_submit_never_creates_a_pending_transfer() -> None:
@@ -439,9 +506,10 @@ def test_reused_rank_and_job_after_worker_restart_cannot_join_scheduler_fact(
         validate_restore_chain(workers + facts, "request-7")
 
 
-def test_binding_fails_closed_on_unknown_host_api() -> None:
+@pytest.mark.parametrize("api_version", ["1.0", "2.0"])
+def test_binding_fails_closed_on_unknown_host_api(api_version: str) -> None:
     host = FakeHost()
-    host.KV_TRANSFER_OBSERVABILITY_API_VERSION = "2.0"
+    host.KV_TRANSFER_OBSERVABILITY_API_VERSION = api_version
 
     try:
         VllmOffloadingObserverBinding(host)

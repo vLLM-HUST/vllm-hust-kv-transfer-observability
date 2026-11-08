@@ -19,6 +19,8 @@ def reset_plugin(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("VLLMHUST_EXT_ENABLED_BUNDLES", raising=False)
     monkeypatch.delenv("VLLM_PLUGINS", raising=False)
     monkeypatch.delenv(plugin.EVENT_PATH_ENV, raising=False)
+    monkeypatch.delenv(plugin.DESCRIPTOR_DIR_ENV, raising=False)
+    monkeypatch.delenv(plugin.EVIDENCE_LABEL_ENV, raising=False)
 
 
 def test_plugin_is_inert_without_explicit_activation(monkeypatch):
@@ -56,6 +58,25 @@ def test_plugin_registers_once_and_stops(monkeypatch, tmp_path: Path):
     assert adapter_factory.call_args.kwargs == {"retain_restore_receipts": False}
     assert plugin.stop_plugin() is True
     adapter.stop.assert_called_once()
+
+
+def test_plugin_configures_descriptor_capture_from_explicit_environment(
+    monkeypatch, tmp_path: Path
+):
+    adapter = Mock()
+    adapter.start.return_value = True
+    monkeypatch.setattr(plugin, "KVTransferHostAdapter", Mock(return_value=adapter))
+    monkeypatch.setattr(plugin, "VllmOffloadingObserverBinding", Mock())
+    monkeypatch.setenv("VLLM_PLUGINS", plugin.PLUGIN_NAME)
+    monkeypatch.setenv(plugin.EVENT_PATH_ENV, str(tmp_path / "events.jsonl"))
+    monkeypatch.setenv(plugin.DESCRIPTOR_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(plugin.EVIDENCE_LABEL_ENV, "existing-server-probe")
+
+    plugin.register_plugin()
+
+    config = plugin.KVTransferHostAdapter.call_args.args[0]
+    assert config.descriptor_dir == tmp_path
+    assert config.evidence_label.value == "existing-server-probe"
 
 
 def test_default_destination_is_launch_and_process_scoped(monkeypatch, tmp_path):

@@ -101,6 +101,13 @@ for preconfiguration and performs no I/O.
 
 ## Current validation level
 
+The CI wheel-removal check installs the built wheel in a disposable environment,
+verifies both entry points, removes the package twice, and confirms that an
+existing evidence file remains. It does not stop an active observer or prove
+live Worker cleanup. Stop the running adapter before uninstalling; real
+single-card stop and uninstall results are recorded in
+[current host compatibility](current_host_compatibility.md).
+
 The filesystem test matrix is Linux/POSIX, using directory file descriptors,
 no-follow opens, file locks and POSIX permission bits. Native Windows is not a
 validated sink/descriptor platform. WSL validation must use a native Linux
@@ -116,12 +123,12 @@ also check initialization cause preservation, cleanup after multiple errors,
 and the distinction between write failures, close exceptions and timeouts.
 
 Manifest 0.3 uses the source-specific binding in `native.py` and an explicitly
-gated `vllm.general_plugins` entry point. Published v1 recovery callbacks stay
-as unjoined facts; local v2 callbacks can provide complete rosters for offline
-validation. The plugin's opted-in post-fork reinitialization discards inherited
-writers and registers a new child-owned adapter when the local host loader
-calls it. Descriptor association remains detached until the copy site has
-request identity and ordering; hardware qualification remains separate.
+gated `vllm.general_plugins` entry point. V1 recovery facts remain
+unjoined; the tested v1.1 host and v2 correlated callbacks supply bounded
+descriptor identity and complete recovery rosters for offline validation.
+The plugin's opted-in post-fork reinitialization discards inherited writers
+and registers a new child-owned adapter when the host loader calls it.
+Hardware qualification remains limited to the exact tested pairing.
 
 The native entry point does not retain successful H2D receipts in the
 normalizer's recovery-admission table, since scheduler admissions are not

@@ -28,17 +28,17 @@
     },
     {
       "dimension": "host-api",
-      "value": "vllm.kv-transfer.observer >=1,<2",
+      "value": "vllm.kv-transfer.observer ==1.1",
       "state": "accepted",
-      "evidence": "Manifest protocol range plus the host capability-registry check. Unknown API versions fail closed (tests/test_native.py::test_binding_fails_closed_on_unknown_host_api).",
+      "evidence": "Manifest protocol equality plus the host capability-registry check. API 1.0 and unknown versions fail closed before activation (tests/test_manifest.py and tests/test_native.py::test_binding_fails_closed_on_unknown_host_api).",
       "reference": "tests/test_native.py"
     },
     {
       "dimension": "host-api",
-      "value": "vllm.kv-transfer.observer.v2 (local follow-up seam)",
-      "state": "unqualified",
-      "reason": "Uncommitted and unpublished. The manifest requires only v1, so no installed host can produce a v2 chain; a v1 host yields Worker-local records only.",
-      "reference": "docs/current_host_compatibility.md"
+      "value": "vllm.kv-transfer.observer.v2 ==2.0",
+      "state": "verified",
+      "evidence": "The optional v2 binding validates the exact API version and joins scheduler/Worker generation, recovery epoch, accepted roster and first-compute records; synthetic contract and rejection paths run in CI (tests/test_correlated.py and tests/test_native.py).",
+      "reference": "tests/test_correlated.py"
     },
     {
       "dimension": "python",
@@ -107,7 +107,7 @@
       "dimension": "hardware",
       "value": "multi-card / multi-rank",
       "state": "unqualified",
-      "reason": "No multi-rank receipt aggregation and no multi-card run; the published v1 seam also lacks a shared cross-process identity.",
+      "reason": "No multi-rank receipt aggregation and no multi-card run. The v2 seam provides bounded cross-process identity, but it has not been qualified across multiple ranks or devices.",
       "reference": "docs/current_host_compatibility.md"
     },
     {
@@ -155,16 +155,16 @@
     {
       "dimension": "feature",
       "value": "complete cross-process v2 restore chain",
-      "state": "unqualified",
-      "reason": "Requires the unmerged v2 host seam. Published v1 callbacks cannot join scheduler and Worker identities, and no timestamp or filename join is substituted.",
+      "state": "diagnostic",
+      "evidence": "A local single-card Qwen3-0.6B pressure run validated two complete restore episodes with exact scheduler/Worker generations, recovery epochs, accepted rosters and first compute. This is not a multi-rank or production qualification.",
       "reference": "docs/current_host_compatibility.md"
     },
     {
       "dimension": "feature",
-      "value": "descriptor-layout capture",
-      "state": "unqualified",
-      "reason": "Copy sites emit region-relative descriptors without request or rank identity and without an ordering rule, so the binding rejects them.",
-      "reference": "docs/current_host_compatibility.md"
+      "value": "descriptor-layout identity and validation contract",
+      "state": "verified",
+      "evidence": "CI covers exact request/rank/generation/operation/submission-token association, rejection of wrong or replayed tokens, bounded inventories and fail-closed incomplete layouts (tests/test_native.py and tests/test_correlated.py). Real-device capture remains a diagnostic claim only.",
+      "reference": "tests/test_native.py"
     }
   ]
 }

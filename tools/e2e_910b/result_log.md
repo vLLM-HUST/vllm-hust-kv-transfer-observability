@@ -12,7 +12,8 @@
 | 节点 | （.87 / .91 / 其他） |
 | NPU | `npu-smi info` 摘要（型号/数量/驱动） |
 | OS / Python | |
-| vllm 版本 + commit | `python -c "import vllm; print(vllm.__version__)"` + `git rev-parse HEAD` |
+| core 版本 + commit | `python -c "import vllm; print(vllm.__version__)"` + `git rev-parse HEAD` |
+| Ascend 版本 + commit + 本地补丁 | |
 | torch / torch_npu | |
 | kv-transfer-observability 版本 | |
 | extension-manager 版本 | |
@@ -48,6 +49,6 @@ bash 01_env_probe.sh | tee result_0_<date>.txt
 
 - 启动命令（含 `--kv-transfer-config` 全文）
 - preemption 制造方式（并发数/序列长度/模型）
-- 预期 6-event 链 vs 实际（verify_events.py --expect-restore-chain 输出）
+- 预期恢复轮次与实际关联链（`python -m vllm_hust_kv_transfer_observability.validation --expect-restore-chain REQUEST_ID` 输出）
 - descriptor capture 清单
 - 性能对比（Tier 3）：禁用 vs 启用，TTFT/TPOT/吞吐，±%

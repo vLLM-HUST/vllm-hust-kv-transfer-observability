@@ -1,58 +1,64 @@
-# Tier 2/3 前置条件与缺口（2026-09-29 记录）
+# 910B preflight (2026-10-12)
 
-本文件只记录"能不能跑"的事实与前置条件。**不含任何未实测的结论。**
-Tier 0/1 的脚本可立即在目标环境执行；Tier 2/3 的 driver 脚本尚未编写，
-因为其依赖项尚未满足（理由见下），编写一个跑不起来的 driver 没有意义。
+The old 2026-09-29 preflight predates the merged host and plugin changes.
+[core #46](https://github.com/vLLM-HUST/vllm-hust/pull/46),
+[core #48](https://github.com/vLLM-HUST/vllm-hust/pull/48), and
+[plugin #12](https://github.com/vLLM-HUST/vllm-hust-kv-transfer-observability/pull/12)
+are merged. The plugin Manifest 0.3 carrier is activatable after an explicit
+enable; installation alone does not activate it. Tier 1 must check the real
+host capability registry, rather than expecting an `import_only` refusal.
 
-## 现在就能跑（不依赖宿主接线）
+One 910B2 diagnostic has already run real CPU KV offload/restore and two
+complete correlated recovery episodes. It used core code before the final
+#48 merge, an isolated Ascend source tree at `575bd1c265` with local fixes,
+and a directly built native binding. It does not establish a compatible
+package installation, V2 runner, multi-rank behavior, descriptor correlation,
+graceful backend-fault recovery, or stable overhead. Exact commands and raw
+artifacts are under the local workspace's `runtime-npu/`; see
+`docs/current_host_compatibility.md`.
 
-| Tier | 脚本 | 依赖 |
-|---|---|---|
-| 0 | `01_env_probe.sh` | 集群 shell（npu-smi） |
-| 1 | `02_package_check.sh` | 910B 上任意能装 `vllm-hust-ext` 的 Python 环境 |
+A 2026-10-09 rerun using the merged core/plugin source and the same Ascend
+candidate again produced real KV restore, two complete recovery episodes,
+disabled-plugin silence, and live-stop behavior. A subsequent clean-wheel
+installation also passed dependency checking, Manager lifecycle checks,
+real restore, two pressure-recovery episodes, disabled-plugin silence and
+live stop. See the exact locally adapted package combination and remaining
+limits in `docs/current_host_compatibility.md`; broader device gates remain open.
 
-两者都不需要 vLLM 服务能起来。
+Ascend collaborator commit `3a5912bb92a8` supplies the two planned copy-site
+descriptor and V1 first-compute call sites. They remain outside Ascend `main`.
+The latest checked Ascend main `8770e692` fails import against merged core
+`5a820400` in the current environment; Ascend `575bd1c265` with the
+call sites and local import guards passes the focused native CPU-offload tests.
+The unmodified candidate's Transformers 5.14.1 pin conflicts with core's
+`>=5.16.1,<5.20.0`. The local full Ascend wheel uses 5.19.0 instead.
+Triton-Ascend 3.6 is available from the official Huawei nightly index;
+the tested local nightly package relaxes its NumPy pin to `>=2,<2.3`,
+allowing core's OpenCV dependency. The clean 190-package set passes
+`uv pip check` and NPU correctness probes. This is a local adaptation,
+not an unmodified upstream-supported combination.
+The subsequent source build at Triton `5aef383d` now also passes the same
+dependency check, fresh-cache NPU vector add, 273 focused tests, Manager
+lifecycle and two complete real pressure-recovery episodes. The tested
+wheel is `3.6.0+git5aef383d`, built with its bundled LLVM 22 linker.
 
-## Tier 2/3 的前置条件（当前均未满足）
+Tier 0 (`01_env_probe.sh`) records the machine. Tier 1
+(`02_package_check.sh`) now takes an exact wheel and requires a Python
+environment with the matched host installed; it fails if the capability
+check degrades or dependencies conflict. Run it in a disposable environment:
 
-1. **宿主侧出口未落地**。`vLLM-HUST/vllm-hust#46`（默认关闭的
-   `register_kv_transfer_observer` seam、`emit_kv_transfer_descriptors`、
-   `build_region_descriptors`）仍为 OPEN，未进 vllm-hust main。
-   Ascend 侧的两个调用点（`vllm_ascend/distributed/kv_transfer/kv_pool/kv_offload/native/cpu_npu.py`、
-   `vllm_ascend/worker/model_runner_v1.py`）已在
-   `feat/kv-transfer-observability-call-sites`（commit `3a5912bb92a8`）写好，
-   但按该提交自身的说明"parked until that PR lands; the PR and its unit tests
-   come with it"——**在 #46 合入前不具备可运行性**。
+```bash
+KV_OBSERVER_PYTHON=/path/to/venv/bin/python \
+KV_OBSERVER_UV=/path/to/uv \
+bash 02_package_check.sh /path/to/plugin.whl
+```
 
-2. **插件侧接线点仍未完成**。`KVTransferHostAdapter`
-   （`start(HostObserverBinding)` / `observe(...)` / `capture_descriptor(...)` /
-   `stop()`，见 `src/.../adapter.py`）已在 main，但"把插件接到真实宿主出口"
-   仍是 **DRAFT PR #7 `feature/issue2-current-host-binding`** 的 next step
-   （该 PR 正文自述：does not implement a real source binding）。
-
-3. **需要一台能真正跑起 vLLM 服务的 910B 环境**，已知当前不满足：
-   - `.86`（aarch64，:32022）：triton-ascend 与 triton 版本错配，服务能起、首请求崩；
-   - `.87`（:32012）：vllm-hust 树与 vllm-ascend-hust 缺
-     `_get_packed_kv_cache_groups` / `RoutedExpertsLists`；
-   - 结论：Tier 2/3 需要**配套 commit 对**的镜像/环境，不是本机或现有测试机可完成。
-
-## 写 driver 时必须使用的真实 API 名（勿臆造）
-
-- 宿主侧（#46 分支）：
-  `register_kv_transfer_observer`、`emit_kv_transfer_descriptors`、
-  `build_region_descriptors`、`kv_transfer_observers_configured`、
-  `TransferOperation`、`observe_forward_batch`
-- 插件侧（main）：
-  `KVTransferHostAdapter`、`ObserverConfig.from_mapping`、`HostObserverBinding`、
-  `HostObserverCallbacks`、`HOST_OBSERVER_CONTRACT` = `"vllm.kv-transfer.observer.v1"`
-
-## 校验器
-
-`verify_events.py` 已随本目录提供，编译通过；可在任何 Python 3 环境独立运行，
-用于校验 events.jsonl 的事件词表/schema/链顺序，以及 descriptor 文件的 4 键
-schema 与"无地址"红线。
-
-## 复现本目录的落地状态
-
-本目录此前是未跟踪文件（不在任何 commit 中）。2026-09-29 已在一个分支上纳入版本控制，
-以免这套 issue #2 的验收材料丢失。
+The older `verify_events.py` script is a historical Tier 0/1 artifact and
+must not be used to certify the v2 recovery chain. No committed Tier 2/3
+driver exists yet. The locally rebuilt host/plugin wheels have passed an
+identity-matched descriptor run, a controlled failed backend-report test,
+plugin-writer ENOSPC injection, live stop, and uninstall/reinstall on one
+910B2. See `docs/current_host_compatibility.md` and the local raw artifacts
+under `verification-current-20261009/single-card-20261012/`. V2 model-runner,
+in-place Worker restart, HTTP serving, physical device faults, and broad
+overhead characterization remain untested; multi-card is outside this stage.

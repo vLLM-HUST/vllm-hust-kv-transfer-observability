@@ -186,7 +186,7 @@ def test_malformed_nested_roster_is_rejected() -> None:
 
 class FakeV1:
     KV_TRANSFER_OBSERVER_CONTRACT = "vllm.kv-transfer.observer.v1"
-    KV_TRANSFER_OBSERVABILITY_API_VERSION = "1.0"
+    KV_TRANSFER_OBSERVABILITY_API_VERSION = "1.1"
 
     def __init__(self) -> None:
         self.callback = None
