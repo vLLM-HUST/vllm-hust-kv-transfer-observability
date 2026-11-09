@@ -54,11 +54,17 @@ bash 02_package_check.sh /path/to/plugin.whl
 ```
 
 The older `verify_events.py` script is a historical Tier 0/1 artifact and
-must not be used to certify the v2 recovery chain. No committed Tier 2/3
-driver exists yet. The locally rebuilt host/plugin wheels have passed an
+must not be used to certify the v2 recovery chain. The locally rebuilt
+host/plugin wheels have passed an
 identity-matched descriptor run, a controlled failed backend-report test,
 plugin-writer ENOSPC injection, live stop, and uninstall/reinstall on one
 910B2. See `docs/current_host_compatibility.md` and the local raw artifacts
 under `verification-current-20261009/single-card-20261012/`. V2 model-runner,
 in-place Worker restart, HTTP serving, physical device faults, and broad
 overhead characterization remain untested; multi-card is outside this stage.
+
+`03_tier2_driver.py` is committed as the Tier 2 driver. It has not been run on
+a qualified pair yet, so no Tier 2 result exists: it only makes the next run
+reproducible and refuses to exit 0 without real transfer, descriptor, and
+restore-chain evidence. Treat every future run as a candidate that still needs
+its manifest and raw artifacts reviewed.
