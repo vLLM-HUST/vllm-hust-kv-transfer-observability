@@ -195,6 +195,18 @@ def test_dry_run_prints_the_plan_without_starting_a_server(
     assert not (tmp_path / "events.jsonl").exists()
 
 
+def test_run_refuses_to_mix_with_existing_evidence(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    (tmp_path / "events.jsonl").write_text("stale\n", encoding="utf-8")
+    code = driver.main(_plan(tmp_path))
+    printed = json.loads(capsys.readouterr().out)
+    assert code == 2
+    assert printed["outcome"] == "output_not_empty"
+    assert (tmp_path / "events.jsonl").read_text(encoding="utf-8") == "stale\n"
+    assert not (tmp_path / "preflight.json").exists()
+
+
 def test_parse_args_requires_the_target_python() -> None:
     with pytest.raises(SystemExit):
         driver.parse_args(["--model", "/models/target", "--out", "/tmp/out"])

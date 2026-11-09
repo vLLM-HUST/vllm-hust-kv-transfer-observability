@@ -591,6 +591,17 @@ def execute(args: argparse.Namespace) -> int:
     if args.dry_run:
         print(_encode({"mode": "dry-run", "plan": plan}))
         return 0
+    if out_dir.exists() and (not out_dir.is_dir() or any(out_dir.iterdir())):
+        print(
+            _encode(
+                {
+                    "outcome": "output_not_empty",
+                    "out_dir": str(out_dir),
+                    "detail": "refusing to mix this run with existing evidence",
+                }
+            )
+        )
+        return 2
     out_dir.mkdir(parents=True, exist_ok=True)
     events_path = out_dir / "events.jsonl"
     descriptor_dir = None if args.no_descriptors else out_dir / "descriptors"
@@ -736,17 +747,22 @@ def execute(args: argparse.Namespace) -> int:
                 process.terminate()
             try:
                 exit_code = process.wait(timeout=args.shutdown_grace)
+                stop_detail = f"SIGINT exit {exit_code} within {args.shutdown_grace}s"
             except subprocess.TimeoutExpired:
                 if os.name == "posix":
                     os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                 else:
                     process.kill()
                 exit_code = process.wait(timeout=60)
+                stop_detail = (
+                    f"SIGKILL exit {exit_code} after SIGINT exceeded "
+                    f"{args.shutdown_grace}s"
+                )
             checks.append(
                 {
-                    "name": "graceful_teardown",
+                    "name": "server_stopped",
                     "status": "pass",
-                    "detail": f"SIGINT exit {exit_code} within {args.shutdown_grace}s",
+                    "detail": stop_detail,
                 }
             )
         if log_stream is not None:
